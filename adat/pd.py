@@ -15,6 +15,8 @@
 ## along with this program; if not, see <http://www.gnu.org/licenses/>.
 ##
 
+import math
+
 import sigrokdecode as srd
 
 '''
@@ -26,6 +28,9 @@ Packet:
 <ptype>, <pdata>:
  - 'SAMPLE', [<channel>, <value>]    channel 1..8, value signed 24-bit int
  - 'USER', <value>                   4 user bits of the frame, 0..15
+ - 'FLAGS', {'timecode': 0|1, 'midi': 0|1, 'smux': 0|1, 'reserved': 0|1}
+ - 'MIDI', <byte>, [<alternatives>]  experimental, see the midi_uart option;
+                                       alternatives is non-empty if the byte was ambiguous
 '''
 
 # Frame layout, 256 bit cells per frame (bit rate = 256 * frame rate):
@@ -64,6 +69,34 @@ BOOT_MAX_US = 1.60
 # Fewer samples per bit cell than this cannot be rounded to cells reliably.
 MIN_SAMPLES_PER_BIT = 4.0
 
+# The four user bits of a frame. Public descriptions name them (timecode
+# transport, MIDI transport, S/MUX indication, reserved = 0) but do not state
+# the order they are sent in, hence the 'user_order' option.
+FLAG_NAMES = ('timecode', 'midi', 'smux', 'reserved')
+FLAG_LABELS = ('Timecode', 'MIDI', 'S/MUX', 'Reserved')
+FLAG_SHORT = ('TC', 'MIDI', 'SMUX', 'Rsvd')
+
+# Annotation classes. Samples get one class per channel so DSView colours
+# neighbouring channels differently.
+(A_SYNC, A_USER, A_FRAME, A_ERROR, A_BIT, A_MARKER,
+ A_TIMECODE, A_MIDI, A_SMUX, A_RESERVED) = range(10)
+A_CH0 = 10
+A_FLAGS = (A_TIMECODE, A_MIDI, A_SMUX, A_RESERVED)
+A_MIDIBYTE = A_CH0 + 8
+
+# EXPERIMENTAL MIDI-over-ADAT: the MIDI user bit is read once per frame and
+# fed to a 31250 baud 8N1 UART (idle = 1, LSB first). This is an assumption,
+# not a documented encoding. At 48 kHz a frame is 20.8 us and a UART bit
+# 32 us, so each bit is seen only 1-2 times and the start edge is known to
+# one frame.
+MIDI_BAUD = 31250
+MIDI_STATUS = {0x80: 'Note Off', 0x90: 'Note On', 0xA0: 'Poly Aftertouch',
+               0xB0: 'Control Change', 0xC0: 'Program Change',
+               0xD0: 'Channel Aftertouch', 0xE0: 'Pitch Bend'}
+MIDI_SYSTEM = {0xF0: 'SysEx', 0xF7: 'SysEx End', 0xF8: 'Clock',
+               0xFA: 'Start', 0xFB: 'Continue', 0xFC: 'Stop',
+               0xFE: 'Active Sensing', 0xFF: 'Reset'}
+
 RATES = {'auto': None, '32 kHz': 32000, '44.1 kHz': 44100, '48 kHz': 48000}
 
 class SamplerateError(Exception):
@@ -89,24 +122,45 @@ class Decoder(srd.Decoder):
         {'id': 'format', 'desc': 'Sample format', 'default': 'hex+signed',
             'values': ('hex', 'signed', 'hex+signed'),
             'idn': 'dec_adat_opt_format'},
+        {'id': 'user_order', 'desc': 'User bit order',
+            'default': 'first sent = bit 0',
+            'values': ('first sent = bit 0', 'first sent = bit 3'),
+            'idn': 'dec_adat_opt_user_order'},
+        {'id': 'midi_uart', 'desc': 'MIDI bit as 31250 baud UART (experimental)',
+            'default': 'off', 'values': ('off', 'idle high', 'idle low'),
+            'idn': 'dec_adat_opt_midi_uart'},
         {'id': 'bits', 'desc': 'Show individual bits', 'default': 'no',
             'values': ('no', 'yes'), 'idn': 'dec_adat_opt_bits'},
     )
     annotations = (
         ('sync', 'Frame sync'),
-        ('user', 'User bits'),
-        ('sample', 'Sample'),
+        ('user', 'User nibble'),
         ('frame', 'Frame'),
         ('error', 'Error'),
         ('bit', 'Bit'),
         ('marker', 'Sync bit'),
+        ('timecode', 'Timecode bit'),
+        ('midi', 'MIDI bit'),
+        ('smux', 'S/MUX flag'),
+        ('reserved', 'Reserved bit'),
+        ('ch1', 'Channel 1'),
+        ('ch2', 'Channel 2'),
+        ('ch3', 'Channel 3'),
+        ('ch4', 'Channel 4'),
+        ('ch5', 'Channel 5'),
+        ('ch6', 'Channel 6'),
+        ('ch7', 'Channel 7'),
+        ('ch8', 'Channel 8'),
+        ('midibyte', 'MIDI byte (experimental)'),
     )
     annotation_rows = (
-        ('frames', 'Frames', (3,)),
-        ('control', 'Sync / User', (0, 1)),
-        ('samples', 'Samples', (2,)),
-        ('bits', 'Bits', (5, 6)),
-        ('errors', 'Errors', (4,)),
+        ('frames', 'Frames', (A_FRAME,)),
+        ('control', 'Sync / User', (A_SYNC, A_USER)),
+        ('flags', 'User bits', A_FLAGS),
+        ('samples', 'Samples', tuple(range(A_CH0, A_CH0 + CHANNELS))),
+        ('midi', 'MIDI bytes', (A_MIDIBYTE,)),
+        ('bits', 'Bits', (A_BIT, A_MARKER)),
+        ('errors', 'Errors', (A_ERROR,)),
     )
 
     def __init__(self):
@@ -122,6 +176,18 @@ class Decoder(srd.Decoder):
         self.glitch = False
         self.frame_no = 0
         self.rate_checked = False
+        self.midi_reset()
+
+    def midi_reset(self, need_idle=False):
+        # After a lost frame the byte boundaries are unknown. The longest
+        # high run inside a valid byte is 9 bits (8 data + stop), so ten
+        # high bits in a row means the line is idle and a start bit is safe.
+        self.midi_idle_ok = not need_idle
+        self.midi_high_since = None
+        self.midi_frames = []    # (instant, level) of recent frames
+        self.midi_start = None   # (last high, first low) frame of a byte in flight
+        self.midi_resume = 0     # no new start bit before this sample
+        self.midi_last = None
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -148,7 +214,7 @@ class Decoder(srd.Decoder):
             return
         self.rate_checked = True
         if self.period < MIN_SAMPLES_PER_BIT:
-            self.putx(at, at + self.period, [4, [
+            self.putx(at, at + self.period, [A_ERROR, [
                 'Sample rate too low: %.1f samples per bit, use at least '
                 '100 MS/s' % self.period, 'Sample rate too low', 'Rate']])
 
@@ -176,7 +242,7 @@ class Decoder(srd.Decoder):
 
     def lose_lock(self, at):
         if self.starts is not None:
-            self.putx(self.starts[0], at, [4, [
+            self.putx(self.starts[0], at, [A_ERROR, [
                 'Signal lost, no frame sync', 'Signal lost', 'Lost']])
         self.starts = None
         self.vals = None
@@ -211,13 +277,27 @@ class Decoder(srd.Decoder):
 
     def fmt_sample(self, ch, raw, signed):
         h = '%06X' % raw
+        if signed == 0:
+            level = '-inf dBFS'
+        else:
+            level = '%.1f dBFS' % (20 * math.log10(abs(signed) / 8388608.0))
         if self.options['format'] == 'hex':
-            return ['Ch%d: 0x%s' % (ch, h), '%d: %s' % (ch, h), h]
+            return ['Ch%d: 0x%s  %s' % (ch, h, level),
+                    'Ch%d: 0x%s' % (ch, h), '%d: %s' % (ch, h), h]
         if self.options['format'] == 'signed':
-            return ['Ch%d: %d' % (ch, signed), '%d: %d' % (ch, signed),
+            return ['Ch%d: %d  %s' % (ch, signed, level),
+                    'Ch%d: %d' % (ch, signed), '%d: %d' % (ch, signed),
                     '%d' % signed]
-        return ['Ch%d: 0x%s (%d)' % (ch, h, signed),
+        return ['Ch%d: 0x%s (%d)  %s' % (ch, h, signed, level),
+                'Ch%d: 0x%s (%d)' % (ch, h, signed),
                 'Ch%d: 0x%s' % (ch, h), '%d: %s' % (ch, h), h]
+
+    def user_flags(self, nibble_bits):
+        """nibble_bits: the four user bits in the order they are sent.
+        Returns the flag values (timecode, midi, smux, reserved)."""
+        if self.options['user_order'] == 'first sent = bit 0':
+            return tuple(nibble_bits)
+        return tuple(reversed(nibble_bits))
 
     def end_frame(self, sync_edge):
         """Output the open frame. Returns True if the frame was clean and
@@ -242,7 +322,7 @@ class Decoder(srd.Decoder):
             errors.append('edge glitch')
 
         if errors:
-            self.putx(starts[0], sync_edge, [4, [
+            self.putx(starts[0], sync_edge, [A_ERROR, [
                 'Frame %d error: %s' % (self.frame_no, ', '.join(errors)),
                 'Frame error', 'Err']])
             return False
@@ -256,17 +336,36 @@ class Decoder(srd.Decoder):
         def st(i):
             return sync_edge if i >= FRAME_BITS else starts[i]
 
-        self.putx(starts[0], sync_edge, [3, [
+        sent = [vals[USER_BIT + k] for k in range(4)]
+        flags = self.user_flags(sent)
+        smux = flags[2]
+        self.putx(starts[0], sync_edge, [A_FRAME, [
+            'Frame %d: %.3f kHz, %.3f Mbit/s%s' % (
+                self.frame_no, fs / 1000.0, fs * FRAME_BITS / 1e6,
+                ', S/MUX' if smux else ''),
             'Frame %d: %.3f kHz' % (self.frame_no, fs / 1000.0),
             'Frame %d' % self.frame_no, 'F%d' % self.frame_no]])
-        self.putx(st(0), st(SYNC_BITS), [0, ['Sync', 'S']])
+        self.putx(st(0), st(SYNC_BITS), [A_SYNC, ['Sync', 'S']])
 
         user = 0
-        for i in range(USER_BIT, USER_BIT + 4):
-            user = (user << 1) | vals[i]
-        self.putx(st(USER_BIT), st(USER_BIT + 4), [1, [
-            'User: 0x%X' % user, 'U: %X' % user, '%X' % user]])
+        for v in sent:
+            user = (user << 1) | v
+        names = [FLAG_SHORT[k] for k in range(3) if flags[k]]
+        self.putx(st(USER_BIT), st(USER_BIT + 4), [A_USER, [
+            'User 0x%X: %s' % (user, ' '.join(names) or 'none'),
+            'User 0x%X' % user, '%X' % user]])
         self.putp(st(USER_BIT), st(USER_BIT + 4), ['USER', user])
+        for k in range(4):
+            # Flag k sits at the bit position it is sent in.
+            pos = USER_BIT + (k if self.options['user_order'] ==
+                              'first sent = bit 0' else 3 - k)
+            text = ['%s: %d' % (FLAG_LABELS[k], flags[k]),
+                    '%s %d' % (FLAG_SHORT[k], flags[k]), '%d' % flags[k]]
+            if k == 3 and flags[k]:
+                text[0] = 'Reserved: 1 (expected 0)'
+            self.putx(st(pos), st(pos + 1), [A_FLAGS[k], text])
+        self.putp(st(USER_BIT), st(USER_BIT + 4), [
+            'FLAGS', dict(zip(FLAG_NAMES, flags))])
 
         for c in range(CHANNELS):
             first = DATA_BIT + 30 * c
@@ -276,15 +375,122 @@ class Decoder(srd.Decoder):
                     raw = (raw << 1) | vals[first + 5 * t + b]
             signed = raw - (1 << 24) if raw & 0x800000 else raw
             ss, es = st(first), st(first + SAMPLE_SPAN)
-            self.putx(ss, es, [2, self.fmt_sample(c + 1, raw, signed)])
+            self.putx(ss, es, [A_CH0 + c, self.fmt_sample(c + 1, raw, signed)])
             self.putp(ss, es, ['SAMPLE', [c + 1, signed]])
+
+        if self.options['midi_uart'] != 'off':
+            level = flags[1] if self.options['midi_uart'] == 'idle high' \
+                else 1 - flags[1]
+            self.midi_feed(starts[0], frame_len, level)
 
         if self.options['bits'] == 'yes':
             markers = set((0,) + MARKERS)
             for i in range(FRAME_BITS):
                 self.putx(st(i), st(i + 1),
-                          [6 if i in markers else 5, ['%d' % vals[i]]])
+                          [A_MARKER if i in markers else A_BIT, ['%d' % vals[i]]])
         return True
+
+    # --- experimental MIDI user bit ----------------------------------------------
+
+    def midi_feed(self, instant, frame_len, level):
+        # Gap in the frame sequence (a damaged frame): the byte in flight is
+        # lost, and so is the timing reference.
+        if self.midi_last is not None and instant - self.midi_last > 1.5 * frame_len:
+            if self.midi_start is not None:
+                self.putx(self.midi_start[1], instant, [A_ERROR, [
+                    'MIDI byte interrupted by a damaged frame', 'MIDI lost']])
+            self.midi_reset(need_idle=True)
+        self.midi_last = instant
+        self.midi_frames.append((instant, level))
+        bit = self.samplerate / float(MIDI_BAUD)
+        if level == 1:
+            if self.midi_high_since is None:
+                self.midi_high_since = instant
+            elif instant - self.midi_high_since >= 10 * bit:
+                self.midi_idle_ok = True
+        else:
+            self.midi_high_since = None
+
+        while True:
+            if self.midi_start is None:
+                # A start bit: first low sample after a high one. The edge
+                # fell somewhere between the two.
+                f = self.midi_frames
+                for i in range(1, len(f)):
+                    if f[i][1] == 0 and f[i - 1][1] == 1 and \
+                            f[i][0] >= self.midi_resume and self.midi_idle_ok:
+                        self.midi_start = (f[i - 1][0], f[i][0])
+                        break
+                else:
+                    self.midi_frames = f[-2:]
+                    return
+            lo, hi = self.midi_start
+            if instant < hi + 10 * bit:
+                return
+            self.midi_finish(lo, hi, bit)
+
+    def midi_finish(self, lo, hi, bit):
+        # Each UART bit (32 us) spans at least one frame (<= 31 us), so for
+        # a candidate edge position every bit holds one or more samples.
+        # A position is possible if the samples of each bit agree and the
+        # start/stop bits are 0/1. Several positions can give different
+        # bytes: one sample per frame is only 1.5 samples per baud, so e.g.
+        # 0x3C and 0x1E, or 0x00 and 0x80, can be indistinguishable. Say so
+        # whenever there was a choice.
+        steps = 64
+        found = []
+        for j in range(steps):
+            e = lo + (j + 0.5) * (hi - lo) / steps
+            bits = [None] * 10
+            ok = True
+            for t, v in self.midi_frames:
+                k = int(math.floor((t - e) / bit))
+                if 0 <= k < 10:
+                    if bits[k] is None:
+                        bits[k] = v
+                    elif bits[k] != v:
+                        ok = False
+                        break
+            if ok and bits[0] == 0 and bits[9] == 1 and None not in bits:
+                found.append((e, bits))
+        self.midi_start = None
+        if not found:
+            self.putx(hi, hi + 10 * bit, [A_ERROR, [
+                'MIDI framing error', 'MIDI framing', 'MIDI err']])
+            self.midi_resume = hi + 9 * bit
+        else:
+            decoded = []
+            for e, bits in found:
+                byte = 0
+                for k in range(8):
+                    byte |= bits[1 + k] << k
+                decoded.append(byte)
+            # Middle of the possible range. Majority voting over the range
+            # was tried and gave the same primary byte on every case tested.
+            byte = decoded[len(decoded) // 2]
+            alts = sorted(set(decoded) - set([byte]))
+            e = found[decoded.index(byte)][0]
+            if byte in MIDI_SYSTEM:
+                name = MIDI_SYSTEM[byte]
+            elif byte >= 0xF0:
+                name = 'System'
+            elif byte & 0x80:
+                name = '%s ch%d' % (MIDI_STATUS[byte & 0xF0], (byte & 0xF) + 1)
+            else:
+                name = 'data %d' % byte
+            if alts:
+                other = ' or '.join('0x%02X' % b for b in alts)
+                text = ['MIDI 0x%02X? or %s: %s' % (byte, other, name),
+                        'MIDI 0x%02X? or %s' % (byte, other),
+                        'MIDI 0x%02X?' % byte, '%02X?' % byte]
+            else:
+                text = ['MIDI 0x%02X: %s' % (byte, name),
+                        'MIDI 0x%02X' % byte, '%02X' % byte]
+            self.putx(e, e + 10 * bit, [A_MIDIBYTE, text])
+            self.putp(e, e + 10 * bit, ['MIDI', byte, alts])
+            self.midi_resume = e + 9 * bit
+        self.midi_frames = [f for f in self.midi_frames
+                            if f[0] >= self.midi_resume - 1e-9 - bit]
 
     # --- main loop -------------------------------------------------------------
 

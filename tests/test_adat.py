@@ -8,15 +8,18 @@ sys.path.insert(0, HERE)                    # host sigrokdecode stand-in
 sys.path.insert(0, os.path.dirname(HERE))   # the adat package under test
 
 import sigrokdecode as srd
-from adat.pd import Decoder
+from adat.pd import (Decoder, A_SYNC as SYNC, A_USER as USER,
+                     A_FRAME as FRAME, A_ERROR as ERROR, A_BIT as BIT,
+                     A_MARKER as MARKER, A_TIMECODE, A_MIDI, A_SMUX,
+                     A_RESERVED, A_CH0, A_MIDIBYTE)
 import adat_signal as sig
 
 ANN, PY = srd.OUTPUT_ANN, srd.OUTPUT_PYTHON
-SYNC, USER, SAMPLE, FRAME, ERROR, BIT, MARKER = range(7)
 
 
 def options(**kw):
-    o = {'rate': 'auto', 'format': 'hex+signed', 'bits': 'no'}
+    o = {'rate': 'auto', 'format': 'hex+signed', 'bits': 'no',
+         'user_order': 'first sent = bit 0', 'midi_uart': 'off'}
     o.update(kw)
     return o
 
@@ -28,6 +31,14 @@ def decode(levels, samplerate, **kw):
 def anns(puts, idx):
     return [(ss, es, d[1]) for ss, es, out, d in puts
             if out == ANN and d[0] == idx]
+
+
+def sample_anns(puts):
+    """Sample annotations of all channels in time order, with channel."""
+    out = []
+    for c in range(8):
+        out += [(ss, es, c, t) for ss, es, t in anns(puts, A_CH0 + c)]
+    return sorted(out)
 
 
 def decoded_frames(puts):
@@ -147,12 +158,13 @@ class CleanStream(unittest.TestCase):
         frames = random_frames(6, 6)
         levels, bt = sig.stream(frames, 100_000_000, 48000)
         puts = decode(levels, 100_000_000)
-        samples = anns(puts, SAMPLE)
+        samples = sample_anns(puts)
         self.assertEqual(len(samples), 5 * 8)
         for f in range(5):
             base = 256 * f
             for c in range(8):
-                ss, es, _ = samples[f * 8 + c]
+                ss, es, ch, _ = samples[f * 8 + c]
+                self.assertEqual(ch, c)
                 first = base + 17 + 30 * c
                 self.assertAlmostEqual(ss, bt(first), delta=2.5)
                 self.assertAlmostEqual(es, bt(first + 29), delta=2.5)
@@ -193,10 +205,258 @@ class CleanStream(unittest.TestCase):
     def test_format_option(self):
         levels, _ = sig.stream([([-0x800000] * 8, 0)] * 3, 100_000_000, 48000)
         t = lambda fmt: anns(decode(levels, 100_000_000, format=fmt),
-                             SAMPLE)[0][2]
-        self.assertEqual(t('hex')[0], 'Ch1: 0x800000')
-        self.assertEqual(t('signed')[0], 'Ch1: -8388608')
-        self.assertEqual(t('hex+signed')[0], 'Ch1: 0x800000 (-8388608)')
+                             A_CH0)[0][2]
+        self.assertEqual(t('hex')[0], 'Ch1: 0x800000  0.0 dBFS')
+        self.assertEqual(t('signed')[0], 'Ch1: -8388608  0.0 dBFS')
+        self.assertEqual(t('hex+signed')[0],
+                         'Ch1: 0x800000 (-8388608)  0.0 dBFS')
+
+    def test_level_in_dbfs(self):
+        vals = [0, 0x400000, -0x200000, 1, 0x7FFFFF, 0, 0, 0]
+        levels, _ = sig.stream([(vals, 0)] * 3, 100_000_000, 48000)
+        puts = decode(levels, 100_000_000)
+        got = [anns(puts, A_CH0 + c)[0][2][0].split('  ')[1] for c in range(5)]
+        self.assertEqual(got, ['-inf dBFS', '-6.0 dBFS', '-12.0 dBFS',
+                               '-138.5 dBFS', '-0.0 dBFS'])
+
+
+class UserBits(unittest.TestCase):
+    SR = 100_000_000
+
+    def run_user(self, users, **kw):
+        frames = [([0] * 8, u) for u in users]
+        levels, _ = sig.stream(frames, self.SR, 48000)
+        return decode(levels, self.SR, **kw)
+
+    def flags(self, puts):
+        return [d[1] for ss, es, out, d in puts
+                if out == PY and d[0] == 'FLAGS']
+
+    def test_flags_default_order(self):
+        # User nibble is sent MSB first: sent[0]=timecode, [1]=MIDI,
+        # [2]=S/MUX, [3]=reserved under 'first sent = bit 0'.
+        users = [0b1000, 0b0100, 0b0010, 0b0001, 0b0000, 0b1111, 0b0110]
+        got = self.flags(self.run_user(users))
+        names = ('timecode', 'midi', 'smux', 'reserved')
+        want = [dict(zip(names, [(u >> 3) & 1, (u >> 2) & 1,
+                                 (u >> 1) & 1, u & 1])) for u in users[:-1]]
+        self.assertEqual(got, want)
+
+    def test_flags_reversed_order_option(self):
+        users = [0b1000, 0b0100, 0b0010, 0b0001, 0]
+        got = self.flags(self.run_user(users, user_order='first sent = bit 3'))
+        self.assertEqual([[g[n] for n in ('timecode', 'midi', 'smux',
+                                          'reserved')] for g in got],
+                         [[0, 0, 0, 1], [0, 0, 1, 0],
+                          [0, 1, 0, 0], [1, 0, 0, 0]])
+
+    def test_flag_annotations_sit_on_their_bit_cells(self):
+        levels, bt = sig.stream([([0] * 8, 0b1010)] * 3, self.SR, 48000)
+        puts = decode(levels, self.SR)
+        for cls, pos, text in ((A_TIMECODE, 12, 'Timecode: 1'),
+                               (A_MIDI, 13, 'MIDI: 0'),
+                               (A_SMUX, 14, 'S/MUX: 1'),
+                               (A_RESERVED, 15, 'Reserved: 0')):
+            ss, es, t = anns(puts, cls)[0]
+            self.assertEqual(t[0], text)
+            self.assertAlmostEqual(ss, bt(pos), delta=2.5)
+            self.assertAlmostEqual(es, bt(pos + 1), delta=2.5)
+
+    def test_flag_cells_follow_the_order_option(self):
+        # 'first sent = bit 3': timecode is the last of the four cells.
+        levels, bt = sig.stream([([0] * 8, 0b1000)] * 3, self.SR, 48000)
+        puts = decode(levels, self.SR, user_order='first sent = bit 3')
+        for cls, pos, text in ((A_TIMECODE, 15, 'Timecode: 0'),
+                               (A_MIDI, 14, 'MIDI: 0'),
+                               (A_SMUX, 13, 'S/MUX: 0'),
+                               (A_RESERVED, 12, 'Reserved: 1 (expected 0)')):
+            ss, es, t = anns(puts, cls)[0]
+            self.assertEqual(t[0], text)
+            self.assertAlmostEqual(ss, bt(pos), delta=2.5)
+
+    def test_reserved_bit_set_is_called_out(self):
+        puts = self.run_user([0b0001] * 3)
+        self.assertEqual(anns(puts, A_RESERVED)[0][2][0],
+                         'Reserved: 1 (expected 0)')
+
+    def test_smux_shown_in_frame_and_user_summary(self):
+        puts = self.run_user([0b0010] * 3)
+        self.assertTrue(anns(puts, FRAME)[0][2][0].endswith(', S/MUX'))
+        self.assertEqual(anns(puts, USER)[0][2][0], 'User 0x2: SMUX')
+        puts = self.run_user([0b1100] * 3)
+        self.assertNotIn('S/MUX', anns(puts, FRAME)[0][2][0])
+        self.assertEqual(anns(puts, USER)[0][2][0], 'User 0xC: TC MIDI')
+        self.assertEqual(anns(self.run_user([0] * 3), USER)[0][2][0],
+                         'User 0x0: none')
+
+    def test_frame_text_has_bit_rate(self):
+        text = anns(self.run_user([0] * 3), FRAME)[0][2][0]
+        rate = float(text.split()[4])   # 'Frame 1: 48.0 kHz, 12.288 Mbit/s'
+        self.assertAlmostEqual(rate, 12.288, delta=0.01, msg=text)
+        self.assertTrue(text.endswith('Mbit/s'), text)
+
+    def test_channels_get_distinct_classes(self):
+        puts = self.run_user([0] * 3)
+        for c in range(8):
+            self.assertEqual(len(anns(puts, A_CH0 + c)), 2)
+
+
+class MidiUart(unittest.TestCase):
+    SR = 100_000_000
+
+    def run_midi(self, data, fs=48000, phase=0.0, mode='idle high', **kw):
+        frames = sig.midi_frames(data, fs, phase, **kw)
+        levels, _ = sig.stream(frames, self.SR, fs)
+        return decode(levels, self.SR, midi_uart=mode)
+
+    def midi(self, puts):
+        return [(d[1], d[2]) for ss, es, out, d in puts
+                if out == PY and d[0] == 'MIDI']
+
+    def test_off_by_default(self):
+        puts = self.run_midi([0x90, 0x3C], mode='off')
+        self.assertEqual(self.midi(puts), [])
+        self.assertEqual(anns(puts, A_MIDIBYTE), [])
+
+    def test_unambiguous_bytes_are_exact(self):
+        # 0x55 alternates every bit, so its edges pin the sampling phase.
+        for phase in (0.0, 0.3, 0.6, 0.9):
+            got = self.midi(self.run_midi([0x55, 0x55, 0xAA, 0x55],
+                                          phase=phase))
+            self.assertEqual(got, [(0x55, []), (0x55, []), (0xAA, []),
+                                   (0x55, [])], phase)
+
+    def test_never_wrong_without_saying_so(self):
+        # One sample per frame is 1.5 samples per baud, so some bytes are
+        # genuinely ambiguous. The decoder must then flag it and list the
+        # true byte among the candidates; unflagged results must be exact.
+        rng = random.Random(5)
+        exact = flagged = 0
+        for i in range(20):
+            data = [rng.randrange(256) for _ in range(6)]
+            got = self.midi(self.run_midi(data, phase=i / 20))
+            self.assertEqual(len(got), len(data), (i, data))
+            for (byte, alts), want in zip(got, data):
+                if alts:
+                    flagged += 1
+                    self.assertIn(want, [byte] + alts, (i, want, byte, alts))
+                else:
+                    self.assertEqual(byte, want, (i, want))
+                    exact += 1
+        self.assertGreaterEqual(exact, 0.9 * 120)
+
+    def test_ambiguity_is_shown_in_the_annotation(self):
+        # 0x00 and 0x80 cannot be told apart at some phases.
+        seen = False
+        for i in range(20):
+            puts = self.run_midi([0x00, 0x80], phase=i / 20)
+            for ss, es, t in anns(puts, A_MIDIBYTE):
+                if '?' in t[0]:
+                    seen = True
+                    self.assertIn(' or 0x', t[0])
+        self.assertTrue(seen)
+
+    def test_idle_low_polarity(self):
+        frames = sig.midi_frames([0x55, 0xAA], 48000, 0.2, invert=True)
+        levels, _ = sig.stream(frames, self.SR, 48000)
+        got = self.midi(decode(levels, self.SR, midi_uart='idle low'))
+        self.assertEqual(got, [(0x55, []), (0xAA, [])][:len(got)])
+        self.assertEqual(len(got), 2)
+        # The wrong polarity must not produce the same bytes.
+        wrong = self.midi(decode(levels, self.SR, midi_uart='idle high'))
+        self.assertNotEqual(wrong, got)
+
+    def test_bad_stop_bit_is_a_framing_error(self):
+        data = [0x55, 0x55, 0x55]
+        frames = sig.midi_frames(data, 48000, 0.2, stop=0)
+        levels, _ = sig.stream(frames, self.SR, 48000)
+        puts = decode(levels, self.SR, midi_uart='idle high')
+        errs = [t[0] for ss, es, t in anns(puts, ERROR)]
+        self.assertEqual(self.midi(puts), [])
+        self.assertTrue(errs)
+        self.assertTrue(all(e == 'MIDI framing error' for e in errs), errs)
+        # Each bad byte is one error, not one per low frame of its stop bit.
+        self.assertEqual(len(errs), len(data))
+
+    def test_damaged_frame_interrupts_the_byte_in_flight(self):
+        data = [0x55, 0x55, 0x55]
+        # 14 idle bits between bytes: more than the 10 needed to resync.
+        frames = sig.midi_frames(data, 48000, 0.2, gap_bits=14)
+        bits = []
+        for i, (s, u) in enumerate(frames):
+            fb = sig.frame_bits(s, u)
+            if i == 12:     # inside the first byte (frames 6..21)
+                k = next(j for j in range(17, 256) if fb[j] == 0 and
+                         fb[j - 1] == 0)
+                del fb[k]
+            bits += fb
+        levels, _ = sig.from_bits(bits, self.SR, 48000)
+        puts = decode(levels, self.SR, midi_uart='idle high')
+        errs = [t[0] for ss, es, t in anns(puts, ERROR)]
+        self.assertTrue(any('MIDI byte interrupted' in e for e in errs), errs)
+        # The rest of the interrupted byte must not decode as a byte.
+        self.assertEqual(self.midi(puts), [(0x55, []), (0x55, [])])
+
+    def test_resync_needs_ten_idle_bits_not_a_short_high_run(self):
+        # 0x0F is start, four ones, four zeros, stop. Losing a frame inside
+        # the ones leaves a three-bit high run followed by a falling edge
+        # that is not a start bit.
+        frames = sig.midi_frames([0x0F, 0x55, 0x55], 48000, 0.2, gap_bits=14)
+        bits = []
+        for i, (s, u) in enumerate(frames):
+            fb = sig.frame_bits(s, u)
+            if i == 10:
+                del fb[next(j for j in range(17, 256) if fb[j] == 0 and
+                            fb[j - 1] == 0)]
+            bits += fb
+        levels, _ = sig.from_bits(bits, self.SR, 48000)
+        puts = decode(levels, self.SR, midi_uart='idle high')
+        self.assertEqual(self.midi(puts), [(0x55, []), (0x55, [])])
+
+    def test_no_resync_without_idle_after_a_lost_frame(self):
+        # Back-to-back bytes (2 idle bits) never show ten high bits, so after
+        # a lost frame nothing more is decoded rather than guessed.
+        frames = sig.midi_frames([0x55] * 4, 48000, 0.2, gap_bits=0)
+        bits = []
+        for i, (s, u) in enumerate(frames):
+            fb = sig.frame_bits(s, u)
+            if i == 12:
+                del fb[next(j for j in range(17, 256) if fb[j] == 0 and
+                            fb[j - 1] == 0)]
+            bits += fb
+        levels, _ = sig.from_bits(bits, self.SR, 48000)
+        puts = decode(levels, self.SR, midi_uart='idle high')
+        self.assertEqual(self.midi(puts), [])
+
+    def test_primary_guess_is_mostly_right_when_ambiguous(self):
+        flagged = right = 0
+        for seed in (5, 6, 7, 8):
+            rng = random.Random(seed)
+            for fs in (48000, 44100):
+                for i in range(20):
+                    data = [rng.randrange(256) for _ in range(6)]
+                    for (byte, alts), want in zip(
+                            self.midi(self.run_midi(data, fs, i / 20)), data):
+                        if alts:
+                            flagged += 1
+                            right += byte == want
+        # Measured: 32 of 51. A coin flip between two candidates would be
+        # about half; this pins the range-middle choice.
+        self.assertGreaterEqual(flagged, 40)
+        self.assertGreaterEqual(right / flagged, 0.55)
+
+    def test_byte_names(self):
+        puts = self.run_midi([0x90, 0xFA, 0x7F, 0xF1], phase=0.0, gap_bits=4)
+        names = {t[0] for ss, es, t in anns(puts, A_MIDIBYTE)}
+        text = ' | '.join(sorted(names))
+        self.assertIn('Note On ch1', text)
+        self.assertIn('Start', text)
+        self.assertIn('System', text)
+
+    def test_annotation_spans_ten_uart_bits(self):
+        puts = self.run_midi([0x55, 0x55], phase=0.4)
+        ss, es, _ = anns(puts, A_MIDIBYTE)[0]
+        self.assertAlmostEqual(es - ss, 10 * self.SR / 31250.0, delta=2000)
 
 
 class Faults(unittest.TestCase):

@@ -76,3 +76,34 @@ def stream(frames, samplerate, fs, jitter=0, seed=0, pad=40):
     for samples, user in frames:
         bits += frame_bits(samples, user)
     return from_bits(bits, samplerate, fs, jitter, seed, pad)
+
+
+def midi_frames(data, fs, phase, gap_bits=2, lead=6, seed=1, invert=False,
+                stop=1):
+    """Frames whose MIDI user bit carries `data` as a 31250 baud 8N1 UART,
+    sampled once per frame. phase (0..1) is where the first start edge falls
+    inside a frame cell. The MIDI flag is the second bit sent in the user
+    nibble, i.e. bit 2 of the nibble value."""
+    baud = 31250.0
+    start = (lead + phase) / fs
+    segs = []
+    t = start
+    for b in data:
+        segs.append((t, [0] + [(b >> k) & 1 for k in range(8)] + [stop]))
+        t += (10 + gap_bits) / baud
+
+    def level(tt):
+        for st, bits in segs:
+            if 0 <= tt - st < 10 / baud:
+                return bits[int((tt - st) * baud)]
+        return 1
+
+    rng = random.Random(seed)
+    frames = []
+    for i in range(int(t * fs) + 8):
+        m = level(i / fs)
+        if invert:
+            m = 1 - m
+        frames.append(([rng.randint(-2 ** 23, 2 ** 23 - 1) for _ in range(8)],
+                       m << 2))
+    return frames

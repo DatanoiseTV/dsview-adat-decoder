@@ -107,3 +107,35 @@ def midi_frames(data, fs, phase, gap_bits=2, lead=6, seed=1, invert=False,
         frames.append(([rng.randint(-2 ** 23, 2 ** 23 - 1) for _ in range(8)],
                        m << 2))
     return frames
+
+
+def write_dsl(path, probes, samplerate_text, block_bytes=4096, version=2):
+    """Write a DSView capture the way StoreSession does for version 2:
+    a zip with an INI 'header' and chunks 'L-<probe>/<block>' of bit-packed
+    samples, earliest sample in the least significant bit.
+    probes: {index: (name, levels)}."""
+    import zipfile
+    import numpy as np
+    total = max(len(lv) for _, lv in probes.values())
+    nblocks = 0
+    chunks = {}
+    for idx, (name, levels) in probes.items():
+        bits = np.zeros(total, np.uint8)
+        bits[:len(levels)] = levels
+        packed = np.packbits(bits, bitorder='little').tobytes()
+        parts = [packed[i:i + block_bytes]
+                 for i in range(0, len(packed), block_bytes)]
+        nblocks = len(parts)
+        for k, part in enumerate(parts):
+            chunks['L-%d/%d' % (idx, k)] = part
+    header = ['[version]', 'version = %d' % version, '[header]',
+              'driver = DSLogic U3Pro16', 'device mode = 0',
+              'capturefile = data', 'total samples = %d' % total,
+              'total probes = %d' % len(probes), 'total blocks = %d' % nblocks,
+              'samplerate = %s' % samplerate_text, 'trigger pos = 0']
+    header += ['probe%d = %s' % (i, n) for i, (n, _) in sorted(probes.items())]
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('header', '\n'.join(header) + '\n')
+        # Reverse order: readers must sort blocks numerically.
+        for name, data in reversed(list(chunks.items())):
+            zf.writestr(name, data)

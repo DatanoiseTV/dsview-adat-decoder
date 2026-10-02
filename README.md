@@ -93,6 +93,48 @@ right in 32 of 51 cases. After a damaged frame no byte is output until ten
 high bits have been seen, so back-to-back bytes lose the rest of the burst.
 Whether real hardware uses this encoding is unchecked.
 
+## Exporting the audio (WAV, CSV, ...)
+
+DSView cannot save what a decoder produces (its only export is the annotation
+table; binary output of decoders is not wired to anything in the UI). The
+exporter runs the same `adat/pd.py` on a saved capture instead:
+
+    python3 tools/adat_export.py capture.dsl --channel ADAT -o out
+
+writes `out.wav`, an 8-channel 24-bit WAV (WAVE_FORMAT_EXTENSIBLE). Needs
+numpy. Save the capture from DSView as a `.dsl` file; `--channel` is the probe
+index or name (optional if only one probe was saved).
+
+| `--format` | output |
+|---|---|
+| `wav` (default) | `out.wav`, 8 channels |
+| `wav-split` | `out_ch1.wav` .. `out_ch8.wav`, mono |
+| `csv` | frame, sample index, time, ch1..ch8, user nibble, the four flags, filled |
+| `raw` | `out.s24le.raw`, interleaved signed 24-bit little endian |
+| `npy` | `out.npy`, int32 array of shape (frames, 8) |
+
+Combine with commas, e.g. `--format wav,csv`. Other options: `--rate`,
+`--user-order` and `--midi` as in the decoder, `--wav-rate` (default: the
+nearest of 32000/44100/48000 to the measured frame rate, so an external clock
+that is slightly off still gives a normal WAV), `--no-fill`, `--max-fill
+SECONDS`, `--json PATH` for the report. A packed-bit file works too:
+`--raw --samplerate 100M` (LSB = earliest sample).
+
+Frames the decoder rejects are not output. By default each gap is filled with
+silence of the same duration (up to 1 s), so the audio stays aligned with
+capture time; the CSV marks those rows `filled=1`. The report lists decoder
+errors, user-bit counts and, with `--midi`, the MIDI bytes.
+
+Speed and memory, measured: 0.25 s of audio (25 M samples at 100 MS/s) takes
+about 1 s and 96 MB, roughly 4x slower than real time. The output matched the
+source samples bit for bit.
+
+Not verified against DSView itself: the `.dsl` reader follows the layout in
+DSView's `StoreSession` source (zip, INI `header`, bit-packed chunks
+`L-<probe>/<block>`, LSB first, header version 2). No real capture was
+available, the tests write files in that layout. Older header versions are
+rejected with a message.
+
 ## Behaviour and limits
 
 - A frame is emitted when the next sync arrives, so the last frame of a
@@ -110,8 +152,10 @@ Whether real hardware uses this encoding is unchecked.
     python3 -m unittest discover -s tests
 
 `tests/sigrokdecode.py` is a host stand-in for DSView's module and
-`tests/adat_signal.py` generates sampled waveforms (with jitter, varispeed,
-corruption, MIDI at all start phases). The suite was mutation-checked: 47
-deliberate breaks of the decoder each turn at least one test red.
+`tests/adat_signal.py` generates sampled waveforms and `.dsl` files (with jitter, varispeed,
+corruption, MIDI at all start phases) and `.dsl` files. The suite was
+mutation-checked: 47 deliberate breaks of the decoder and 28 of the exporter
+each turn at least one test red. The exporter's WAV output is read back with
+ffmpeg when it is installed (those tests are skipped otherwise).
 
 GPLv2+, as the DSView decoders.

@@ -5,6 +5,21 @@ All notable changes are listed here. The format follows
 [semantic versioning](https://semver.org/). Versions before 1.0 may change the
 decoder's annotations or Python output.
 
+## [Unreleased]
+
+### Added
+
+- MIDI decoding option `frame bit` (one inverted UART bit per ADAT frame, LSB
+  first, ten frames per byte; resyncs after ten idle frames). The existing
+  `idle high` and `idle low` modes are unchanged. Also accepted by
+  `tools/adat_export.py --midi`. Experimental: the encoding is modelled on
+  RME's MIDI over MADI and not verified on ADAT equipment.
+
+### Changed
+
+- The `MIDI bit as 31250 baud UART` option is now called `MIDI bit decoding`
+  because it also selects the frame-bit scheme.
+
 ## [0.1.0] - 2026-10-03
 
 First public release. Frame sync, rate tracking and user nibble confirmed on

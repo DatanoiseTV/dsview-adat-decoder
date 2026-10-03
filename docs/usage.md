@@ -17,7 +17,7 @@
 | Frame rate (start value) | `auto`, `32 kHz`, `44.1 kHz`, `48 kHz` | `auto` | `auto` finds the sync by its absolute duration and works from 32 kHz to 48 kHz including varispeed. A fixed value only seeds the first sync search (it accepts about +-27 %); the decoder keeps tracking after that. |
 | Sample format | `hex`, `signed`, `hex+signed` | `hex+signed` | How samples are written. Every sample also shows its level in dBFS. |
 | User bit order | `first sent = bit 3`, `first sent = bit 0` | `first sent = bit 3` | Which end of the user nibble goes out first. See [user bits](user-bits-and-midi.md#user-bits). |
-| MIDI bit as 31250 baud UART (experimental) | `off`, `idle high`, `idle low` | `off` | Treat the MIDI user bit as a UART line. See [MIDI](user-bits-and-midi.md#midi-over-the-user-bit). |
+| MIDI bit decoding (experimental) | `off`, `frame bit`, `idle high`, `idle low` | `off` | How to read the MIDI user bit: `frame bit` is one inverted UART bit per frame, `idle high` / `idle low` treat it as a sampled 31250 baud UART. See [MIDI](user-bits-and-midi.md#midi-over-the-user-bit). |
 | Show individual bits | `no`, `yes` | `no` | One annotation per bit, 256 per frame. Slow on long captures. |
 
 ## Annotation rows

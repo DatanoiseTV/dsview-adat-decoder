@@ -510,6 +510,199 @@ class MidiUart(unittest.TestCase):
         self.assertAlmostEqual(es - ss, 10 * self.SR / 31250.0, delta=2000)
 
 
+class MidiFrameBit(unittest.TestCase):
+    """The 'frame bit' scheme: one inverted 8N1 bit per frame."""
+    SR = 100_000_000
+
+    def run_fb(self, levels, fs=48000, mode='frame bit', **kw):
+        levels, _ = sig.stream(sig.user_frames(levels), self.SR, fs)
+        return decode(levels, self.SR, midi_uart=mode, **kw)
+
+    def midi(self, puts):
+        return [(d[1], d[2]) for ss, es, out, d in puts
+                if out == PY and d[0] == 'MIDI']
+
+    def bytes_of(self, puts):
+        return [b for b, alts in self.midi(puts)]
+
+    def test_option_is_declared_with_a_default_of_off(self):
+        opt = [o for o in Decoder.options if o['id'] == 'midi_uart'][0]
+        self.assertIn('frame bit', opt['values'])
+        self.assertEqual(opt['default'], 'off')
+
+    def test_generator_matches_the_hand_derived_waveforms(self):
+        # 0x00: start 1, eight data 0 sent as 1, stop 0. 0xFF: start 1, eight
+        # data 1 sent as 0, stop 0. 0x01: LSB first, so the first data frame
+        # is 0 (a 1 inverted) and the rest are 1.
+        g = sig.framebit_levels
+        self.assertEqual(g([0x00], 48000, lead=0, tail=0),
+                         [1, 1, 1, 1, 1, 1, 1, 1, 1, 0])
+        self.assertEqual(g([0xFF], 48000, lead=0, tail=0),
+                         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(g([0x01], 48000, lead=0, tail=0),
+                         [1, 0, 1, 1, 1, 1, 1, 1, 1, 0])
+        self.assertEqual(g([0x80], 48000, lead=0, tail=0),
+                         [1, 1, 1, 1, 1, 1, 1, 1, 0, 0])
+        self.assertEqual(g([0x55], 48000, lead=0, tail=0),
+                         [1, 0, 1, 0, 1, 0, 1, 0, 1, 0])
+
+    def test_pacing_helper_gives_15_or_16_frames_per_byte_at_48k(self):
+        gaps = sig.paced_gaps(3125, 48000)
+        spacing = set(10 + g for g in gaps)
+        self.assertEqual(spacing, {15, 16})
+        # 3125 bytes take exactly 3125 * 15.36 frames = one second at 48 kHz
+        self.assertEqual(sum(10 + g for g in gaps), 48000)
+        gaps = sig.paced_gaps(3125, 44100)
+        self.assertEqual(set(10 + g for g in gaps), {14, 15})
+        self.assertEqual(sum(10 + g for g in gaps), 44100)
+
+    def test_every_byte_value_decodes_exactly_at_both_rates(self):
+        data = list(range(256))
+        for fs in (48000, 44100):
+            levels = sig.framebit_levels(data, fs, gaps=sig.paced_gaps(256, fs))
+            puts = self.run_fb(levels, fs)
+            self.assertEqual(self.midi(puts), [(b, []) for b in data], fs)
+            self.assertEqual(anns(puts, ERROR), [], fs)
+
+    def test_back_to_back_bytes(self):
+        data = [0x90, 0x3C, 0x64, 0x80, 0x3C, 0x00, 0xFF, 0x00]
+        puts = self.run_fb(sig.framebit_levels(data, 48000, gaps=0))
+        self.assertEqual(self.bytes_of(puts), data)
+        self.assertEqual(anns(puts, ERROR), [])
+
+    def test_random_gaps(self):
+        rng = random.Random(7)
+        data = [rng.randint(0, 255) for _ in range(120)]
+        gaps = [rng.randint(0, 9) for _ in data]
+        puts = self.run_fb(sig.framebit_levels(data, 48000, gaps=gaps))
+        self.assertEqual(self.bytes_of(puts), data)
+
+    def test_byte_annotation_spans_ten_frames(self):
+        puts = self.run_fb(sig.framebit_levels([0x90], 48000, lead=8))
+        (ss, es, t), = anns(puts, A_MIDIBYTE)
+        self.assertEqual(t[0], 'MIDI 0x90: Note On ch1')
+        frame = self.SR / 48000.0
+        self.assertAlmostEqual((es - ss) / frame, 10, delta=0.2)
+        # starts at the first frame with the line high: frame 8
+        self.assertAlmostEqual((ss - 40) / frame, 8, delta=0.2)
+
+    def test_events_are_assembled_from_the_bytes(self):
+        data = [0x90, 0x3C, 0x64, 0xC0, 0x05]
+        puts = self.run_fb(sig.framebit_levels(data, 48000, gaps=6))
+        texts = [t[0] for ss, es, t in anns(puts, A_MIDIEVENT)]
+        self.assertEqual(texts, ['Note On ch1 C4 (60) vel 100',
+                                 'Program Change ch1 -> 5'])
+
+    def test_wrong_polarity_modes_do_not_read_it(self):
+        levels = sig.framebit_levels([0x55, 0xAA, 0x12], 48000, gaps=6)
+        for mode in ('idle high', 'idle low'):
+            got = self.bytes_of(self.run_fb(levels, mode=mode))
+            self.assertNotEqual(got, [0x55, 0xAA, 0x12], mode)
+
+    def test_idle_line_alone_produces_nothing(self):
+        puts = self.run_fb([0] * 200)
+        self.assertEqual(self.midi(puts), [])
+        self.assertEqual(anns(puts, ERROR), [])
+        # a line stuck at 1 has no 0 before its start edge: no byte and no
+        # framing error either (there is no start bit to be wrong about)
+        puts = self.run_fb([1] * 200)
+        self.assertEqual(self.midi(puts), [])
+        self.assertEqual(anns(puts, ERROR), [])
+
+    def test_bad_stop_bit_is_one_framing_error_and_decoding_recovers(self):
+        # 14 idle frames after each byte: ten are needed to resync.
+        levels = sig.framebit_levels([0x55, 0x66, 0x77], 48000, gaps=14,
+                                     stop=[0, 1, 0])
+        puts = self.run_fb(levels)
+        self.assertEqual(self.bytes_of(puts), [0x55, 0x77])
+        errs = [t[0] for ss, es, t in anns(puts, ERROR)]
+        self.assertEqual(errs, ['MIDI framing error'])
+
+    def test_ten_idle_frames_are_exactly_what_a_resync_needs(self):
+        # Byte 1 has a bad stop bit (a 1) and is never delivered. The zeros
+        # that follow count towards the ten: with 9 byte 2 is dropped, with
+        # 10 it is decoded.
+        for gap, want in ((9, []), (10, [0x77]), (11, [0x77])):
+            levels = sig.framebit_levels([0x55, 0x77], 48000,
+                                         gaps=[gap, 0], stop=[1, 0])
+            self.assertEqual(self.bytes_of(self.run_fb(levels)), want, gap)
+
+    def test_after_a_framing_error_short_gaps_give_no_phantom_bytes(self):
+        # With only 4 idle frames the line is not proven idle again, so the
+        # bytes after the bad one are dropped, never invented.
+        levels = sig.framebit_levels([0x55, 0x66, 0x77], 48000, gaps=4,
+                                     stop=[0, 1, 0])
+        puts = self.run_fb(levels)
+        self.assertEqual(self.bytes_of(puts), [0x55])
+        self.assertEqual(len(anns(puts, ERROR)), 1)
+
+    def test_a_one_frame_glitch_on_an_idle_line_is_0xff(self):
+        # The same as on any UART: a short low pulse on an idle high line is
+        # 0xFF. Documented, not a defect.
+        levels = [0] * 10 + [1] + [0] * 30
+        self.assertEqual(self.bytes_of(self.run_fb(levels)), [0xFF])
+
+    def damaged(self, data, gaps, hit):
+        """Wave of `data` with frame `hit` made undecodable (a bit cell is
+        removed, so the frame keeps its place in time but is rejected)."""
+        frames = sig.user_frames(sig.framebit_levels(data, 48000, gaps=gaps))
+        bits = []
+        for i, (s, u) in enumerate(frames):
+            fb = sig.frame_bits(s, u)
+            if i == hit:
+                del fb[next(j for j in range(17, 256) if fb[j] == 0 and
+                            fb[j - 1] == 0)]
+            bits += fb
+        levels, _ = sig.from_bits(bits, self.SR, 48000)
+        return decode(levels, self.SR, midi_uart='frame bit')
+
+    def test_damaged_frame_loses_the_byte_in_flight_and_resyncs(self):
+        # Byte 1 occupies frames 6..15 (lead 6, 14 idle after), byte 2
+        # 30..39; frame 34 is inside it.
+        puts = self.damaged([0x55, 0x66, 0x77], 14, 34)
+        self.assertEqual(self.bytes_of(puts), [0x55, 0x77])
+        # the frame itself is reported by the frame decoder, once
+        errs = [t[0] for ss, es, t in anns(puts, ERROR)]
+        self.assertEqual([e for e in errs if e.startswith('MIDI')],
+                         ['MIDI byte interrupted by a damaged frame'])
+        self.assertEqual(len([e for e in errs if e.startswith('Frame')]), 1)
+
+    def test_damaged_frame_leaves_no_phantom_byte_from_the_remains(self):
+        # 0x66 has data frames 1,0,0,1,1,0,0,1 inverted: after the loss the
+        # rest of the byte holds 0 -> 1 edges. With short gaps the line is
+        # never proven idle again; nothing may be decoded from the remains.
+        puts = self.damaged([0x55, 0x66, 0x77], 4, 6 + 10 + 4 + 4)
+        got = self.bytes_of(puts)
+        self.assertEqual(got[:1], [0x55])
+        for b in got:
+            self.assertIn(b, [0x55, 0x66, 0x77])
+        self.assertNotIn(0x66, got)
+
+    def test_capture_starting_inside_a_byte_never_invents_a_wrong_byte(self):
+        # The state before the first frame is unknown. Starting at any frame
+        # of a stream of known bytes, everything delivered must be a byte
+        # that was sent, in order, once the stream has been seen to go idle.
+        data = [0x12, 0x34, 0x56, 0x78]
+        full = sig.framebit_levels(data, 48000, gaps=14)
+        for cut in range(0, 40):
+            puts = self.run_fb(full[cut:])
+            got = self.bytes_of(puts)
+            self.assertEqual(got[-2:], data[-2:], cut)
+
+    def test_44100_hz_stream_decodes(self):
+        data = [0x90, 0x3C, 0x64, 0xE0, 0x00, 0x40]
+        puts = self.run_fb(sig.framebit_levels(data, 44100, gaps=5), 44100)
+        self.assertEqual(self.bytes_of(puts), data)
+
+    def test_python_output_has_no_alternatives(self):
+        puts = self.run_fb(sig.framebit_levels([0x42], 48000, gaps=6))
+        self.assertEqual(self.midi(puts), [(0x42, [])])
+
+    def test_off_means_off(self):
+        puts = self.run_fb(sig.framebit_levels([0x42], 48000), mode='off')
+        self.assertEqual(self.midi(puts), [])
+
+
 class MidiEvents(unittest.TestCase):
     """The message assembler, fed bytes directly so ambiguity and timing of
     the UART layer play no part."""

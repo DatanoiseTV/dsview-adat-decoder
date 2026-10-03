@@ -398,7 +398,7 @@ def main(argv=None):
     ap.add_argument('--user-order', default='first sent = bit 3',
                     choices=('first sent = bit 3', 'first sent = bit 0'))
     ap.add_argument('--midi', default='off',
-                    choices=('off', 'idle high', 'idle low'),
+                    choices=('off', 'frame bit', 'idle high', 'idle low'),
                     help='experimental MIDI user-bit decoding, listed in the '
                          'report')
     ap.add_argument('--no-fill', action='store_true',

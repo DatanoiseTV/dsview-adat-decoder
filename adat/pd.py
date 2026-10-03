@@ -92,11 +92,15 @@ A_FLAGS = (A_TIMECODE, A_MIDI, A_SMUX, A_RESERVED)
 A_MIDIBYTE = A_CH0 + 8
 A_MIDIEVENT = A_MIDIBYTE + 1
 
-# EXPERIMENTAL MIDI-over-ADAT: the MIDI user bit is read once per frame and
-# fed to a 31250 baud 8N1 UART (idle = 1, LSB first). This is an assumption,
-# not a documented encoding. At 48 kHz a frame is 20.8 us and a UART bit
-# 32 us, so each bit is seen only 1-2 times and the start edge is known to
-# one frame.
+# EXPERIMENTAL MIDI-over-ADAT. Neither encoding below is documented for ADAT.
+#  - 'frame bit': one MIDI bit per frame, the line inverted (idle 0, start 1,
+#    stop 0, data bits inverted), LSB first, 10 frames per byte, bytes spaced
+#    to average 31250 baud. Modelled on RME's MIDI over MADI as described in a
+#    2015 RME forum exchange; exact, no timing ambiguity.
+#  - 'idle high' / 'idle low': the user bit read once per frame is the line of
+#    a 31250 baud 8N1 UART. At 48 kHz a frame is 20.8 us and a UART bit 32 us,
+#    so each bit is seen only 1-2 times and the start edge is known to one
+#    frame.
 MIDI_BAUD = 31250
 MIDI_STATUS = {0x80: 'Note Off', 0x90: 'Note On', 0xA0: 'Poly Aftertouch',
                0xB0: 'Control Change', 0xC0: 'Program Change',
@@ -124,6 +128,26 @@ MIDI_SYSTEM = {0xF0: 'SysEx', 0xF6: 'Tune Request', 0xF7: 'SysEx End',
                0xFE: 'Active Sensing', 0xFF: 'System Reset'}
 
 RATES = {'auto': None, '32 kHz': 32000, '44.1 kHz': 44100, '48 kHz': 48000}
+
+def midi_byte_text(byte, alts):
+    """Annotation texts (long to short) of one decoded MIDI byte; alts are
+    the other bytes the samples were consistent with."""
+    if byte in MIDI_SYSTEM:
+        name = MIDI_SYSTEM[byte]
+    elif byte >= 0xF0:
+        name = 'System'
+    elif byte & 0x80:
+        name = '%s ch%d' % (MIDI_STATUS[byte & 0xF0], (byte & 0xF) + 1)
+    else:
+        name = 'data %d' % byte
+    if alts:
+        other = ' or '.join('0x%02X' % b for b in alts)
+        return ['MIDI 0x%02X? or %s: %s' % (byte, other, name),
+                'MIDI 0x%02X? or %s' % (byte, other),
+                'MIDI 0x%02X?' % byte, '%02X?' % byte]
+    return ['MIDI 0x%02X: %s' % (byte, name),
+            'MIDI 0x%02X' % byte, '%02X' % byte]
+
 
 def midi_data_len(status):
     """Data bytes that follow a channel or system common status byte."""
@@ -157,8 +181,9 @@ class Decoder(srd.Decoder):
             'default': 'first sent = bit 3',
             'values': ('first sent = bit 3', 'first sent = bit 0'),
             'idn': 'dec_adat_opt_user_order'},
-        {'id': 'midi_uart', 'desc': 'MIDI bit as 31250 baud UART (experimental)',
-            'default': 'off', 'values': ('off', 'idle high', 'idle low'),
+        {'id': 'midi_uart', 'desc': 'MIDI bit decoding (experimental)',
+            'default': 'off',
+            'values': ('off', 'frame bit', 'idle high', 'idle low'),
             'idn': 'dec_adat_opt_midi_uart'},
         {'id': 'bits', 'desc': 'Show individual bits', 'default': 'no',
             'values': ('no', 'yes'), 'idn': 'dec_adat_opt_bits'},
@@ -222,6 +247,23 @@ class Decoder(srd.Decoder):
         self.midi_start = None   # (last high, first low) frame of a byte in flight
         self.midi_resume = 0     # no new start bit before this sample
         self.midi_last = None
+        self.fb_reset()
+
+    def fb_reset(self):
+        # 'frame bit' decoder: the line state before the first frame is
+        # unknown, so a start edge needs a 0 seen first.
+        self.fb_prev = None
+        # Byte boundaries are known at the start and after a good byte. After
+        # a lost frame or a bad stop bit they are not: the data frames left
+        # over can hold a 0 -> 1 edge that is no start bit. The longest run of
+        # 0 inside a byte is 9 (eight inverted data 1s and the stop), so ten
+        # 0 frames in a row prove the line idle.
+        self.fb_sync = True
+        self.fb_zeros = 0
+        self.fb_n = 0            # frames of the byte in flight, 0 = hunting
+        self.fb_ss = None        # first frame of the byte in flight
+        self.fb_bits = []        # the 9 frames after the start frame
+        self.fb_last = None
 
     def midi_parser_reset(self):
         # A lost byte makes running status unreliable and the message in
@@ -422,7 +464,9 @@ class Decoder(srd.Decoder):
             self.putx(ss, es, [A_CH0 + c, self.fmt_sample(c + 1, raw, signed)])
             self.putp(ss, es, ['SAMPLE', [c + 1, signed]])
 
-        if self.options['midi_uart'] != 'off':
+        if self.options['midi_uart'] == 'frame bit':
+            self.fb_feed(starts[0], frame_len, flags[1])
+        elif self.options['midi_uart'] != 'off':
             level = flags[1] if self.options['midi_uart'] == 'idle high' \
                 else 1 - flags[1]
             self.midi_feed(starts[0], frame_len, level)
@@ -472,6 +516,55 @@ class Decoder(srd.Decoder):
             if instant < hi + 10 * bit:
                 return
             self.midi_finish(lo, hi, bit)
+
+    def fb_feed(self, instant, frame_len, level):
+        """'frame bit' scheme: one inverted 8N1 UART bit per frame. A byte is
+        the start frame (1), eight data frames (the inverse of the data bit,
+        LSB first) and the stop frame (0). Exact: nothing is ambiguous. After
+        a good byte the next frame may start another one; a bad stop bit or a
+        lost frame is an error after which ten 0 frames must pass before a
+        start is accepted again. A glitch
+        of one frame on an idle line is a valid 0xFF, as on any UART."""
+        if self.fb_last is not None and instant - self.fb_last > 1.5 * frame_len:
+            if self.fb_n:
+                self.putx(self.fb_ss, instant, [A_ERROR, [
+                    'MIDI byte interrupted by a damaged frame', 'MIDI lost']])
+                self.midi_parser_reset()
+            self.fb_prev = None
+            self.fb_n = 0
+            self.fb_sync = False
+            self.fb_zeros = 0
+        self.fb_last = instant
+        if self.fb_n == 0:
+            self.fb_zeros = self.fb_zeros + 1 if level == 0 else 0
+            if self.fb_zeros >= 10:
+                self.fb_sync = True
+            if self.fb_sync and self.fb_prev == 0 and level == 1:
+                self.fb_ss = instant
+                self.fb_bits = []
+                self.fb_n = 1
+            self.fb_prev = level
+            return
+        self.fb_bits.append(level)
+        self.fb_n += 1
+        if self.fb_n < 10:
+            return
+        end = instant + frame_len
+        self.fb_n = 0
+        self.fb_prev = level
+        self.fb_zeros = 1 if level == 0 else 0
+        if self.fb_bits[8] != 0:
+            self.putx(self.fb_ss, end, [A_ERROR, [
+                'MIDI framing error', 'MIDI framing', 'MIDI err']])
+            self.midi_parser_reset()
+            self.fb_sync = False
+            return
+        byte = 0
+        for k in range(8):
+            byte |= (1 - self.fb_bits[k]) << k
+        self.putx(self.fb_ss, end, [A_MIDIBYTE, midi_byte_text(byte, [])])
+        self.putp(self.fb_ss, end, ['MIDI', byte, []])
+        self.midi_event_feed(self.fb_ss, end, byte, False)
 
     def midi_event_feed(self, ss, es, byte, amb):
         """Assemble UART bytes into MIDI messages: running status, realtime
@@ -651,23 +744,7 @@ class Decoder(srd.Decoder):
             byte = decoded[len(decoded) // 2]
             alts = sorted(set(decoded) - set([byte]))
             e = found[decoded.index(byte)][0]
-            if byte in MIDI_SYSTEM:
-                name = MIDI_SYSTEM[byte]
-            elif byte >= 0xF0:
-                name = 'System'
-            elif byte & 0x80:
-                name = '%s ch%d' % (MIDI_STATUS[byte & 0xF0], (byte & 0xF) + 1)
-            else:
-                name = 'data %d' % byte
-            if alts:
-                other = ' or '.join('0x%02X' % b for b in alts)
-                text = ['MIDI 0x%02X? or %s: %s' % (byte, other, name),
-                        'MIDI 0x%02X? or %s' % (byte, other),
-                        'MIDI 0x%02X?' % byte, '%02X?' % byte]
-            else:
-                text = ['MIDI 0x%02X: %s' % (byte, name),
-                        'MIDI 0x%02X' % byte, '%02X' % byte]
-            self.putx(e, e + 10 * bit, [A_MIDIBYTE, text])
+            self.putx(e, e + 10 * bit, [A_MIDIBYTE, midi_byte_text(byte, alts)])
             self.putp(e, e + 10 * bit, ['MIDI', byte, alts])
             self.midi_event_feed(e, e + 10 * bit, byte, bool(alts))
             self.midi_resume = e + 9 * bit

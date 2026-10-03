@@ -266,6 +266,20 @@ class Export(unittest.TestCase):
         with wave.open(self.p('p.wav')) as w:
             self.assertEqual(w.getframerate(), 96000)
 
+    def test_frame_bit_midi_is_reported(self):
+        data = [0x95, 0x55, 0x55, 0xD5, 0x55]
+        levels = sig.framebit_levels(data, 48000, gaps=6)
+        cap = self.capture(sig.user_frames(levels))
+        self.run_export(cap, '--channel', '2', '--midi', 'frame bit', '-o',
+                        self.p('f'), '--json', self.p('f.json'))
+        rep = json.loads(self.read(self.p('f.json')))
+        self.assertEqual([m['byte'] for m in rep['midi_bytes']], data)
+        self.assertEqual([e['text'] for e in rep['midi_events']],
+                         ['Note On ch6 C#6 (85) vel 85',
+                          'Channel Pressure ch6 = 85'])
+        self.assertFalse(any(e['ambiguous'] for e in rep['midi_events']))
+        self.assertGreater(rep['user_bit_frames']['midi'], 0)
+
     def test_midi_and_user_flags_are_reported(self):
         # Note On ch6 C#6 vel 85, then Channel Pressure ch6 = 85.
         data = [0x95, 0x55, 0x55, 0xD5, 0x55]

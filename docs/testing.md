@@ -2,7 +2,7 @@
 
     python3 -m unittest discover -s tests
 
-91 tests, about 5 s. The exporter tests need NumPy. The tests that read the
+112 tests, about 5 s. The exporter tests need NumPy. The tests that read the
 exporter's WAV back with `ffmpeg` and `ffprobe` are skipped when those are not
 installed.
 
@@ -29,7 +29,11 @@ installed.
 ## Mutation checking
 
 The suite was mutation-checked: 70 deliberate breaks of the decoder and 32 of
-the exporter each turn at least one test red.
+the exporter each turn at least one test red. The `frame bit` MIDI decoder
+was checked separately with 20 more breaks (inversion, bit order, stop bit,
+start edge, idle run of ten frames, error handling), each turning at least one
+test red; three of them survived the first version of the tests and led to the
+stuck-high-line and exact-ten-frame rows.
 
 ## What the tests cannot tell you
 

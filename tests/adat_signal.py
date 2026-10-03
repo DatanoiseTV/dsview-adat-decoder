@@ -141,3 +141,41 @@ def write_dsl(path, probes, samplerate_text, block_bytes=4096, version=2):
         # Reverse order: readers must sort blocks numerically.
         for name, data in reversed(list(chunks.items())):
             zf.writestr(name, data)
+
+
+def framebit_levels(data, fs, lead=6, gaps=0, stop=0, tail=12):
+    """Line levels, one per frame, of `data` in the 'frame bit' scheme,
+    written from its definition: inverted 8N1, one bit per frame, idle 0,
+    start frame 1, eight data frames (the inverse of the data bit, LSB first)
+    and a stop frame. `gaps` is the number of idle frames after each byte (an
+    int, or a list with one per byte); `stop` is the stop level of every byte
+    or a list with one per byte (0 is correct)."""
+    levels = [0] * lead
+    for n, b in enumerate(data):
+        s = stop[n] if isinstance(stop, (list, tuple)) else stop
+        levels += [1] + [1 - ((b >> k) & 1) for k in range(8)] + [s]
+        levels += [0] * (gaps[n] if isinstance(gaps, (list, tuple)) else gaps)
+    return levels + [0] * tail
+
+
+def paced_gaps(count, fs):
+    """Idle frames after each of `count` bytes so that the bytes start every
+    10 * fs / 31250 frames on average (15.36 at 48 kHz): Fractions, no
+    floating point."""
+    from fractions import Fraction
+    period = Fraction(10 * fs, 31250)
+    gaps, start, true_start = [], 0, Fraction(0)
+    for _ in range(count):
+        true_start += period
+        nxt = -(-true_start.numerator // true_start.denominator)   # ceiling
+        gaps.append(nxt - start - 10)
+        start = nxt
+    return gaps
+
+
+def user_frames(levels, seed=1):
+    """Frames whose user nibble carries `levels` as the MIDI bit (bit 1 of
+    the nibble value, the third bit sent) and random samples."""
+    rng = random.Random(seed)
+    return [([rng.randint(-2 ** 23, 2 ** 23 - 1) for _ in range(8)], m << 1)
+            for m in levels]

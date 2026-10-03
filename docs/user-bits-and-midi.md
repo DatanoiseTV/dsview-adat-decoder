@@ -39,11 +39,41 @@ value.
 
 ## MIDI over the user bit
 
-Experimental, off by default. The encoding is not documented in a source the
-author found, and whether real hardware uses it is unchecked.
+Experimental, off by default. The ADAT encoding is not documented in a source
+the author found, and whether real hardware uses either scheme below is
+unchecked. Pick one with the `MIDI bit decoding` option.
+
+### `frame bit`: one MIDI bit per frame
+
+One bit of an inverted 8N1 UART per ADAT frame, written from the rules below
+(the only documented real-world scheme for a MIDI bit in an audio stream is
+RME's MIDI over MADI, where an RME administrator confirms the signal is
+inverted and a user reports LSB first with pauses between the bytes; ADAT use
+is a guess). The line idles at 0. A byte is ten frames:
+
+1. start frame: 1
+2. eight data frames, LSB first, each the inverse of the data bit
+3. stop frame: 0
+
+so `0x00` is `1 1 1 1 1 1 1 1 1 0` and `0xFF` is `1 0 0 0 0 0 0 0 0 0`.
+Bytes are paced to average 31250 baud, so they start 15 or 16 frames apart at
+48 kHz (14 or 15 at 44.1 kHz) with idle frames in between. Nothing is
+ambiguous: one frame is one bit.
+
+The decoder looks for a 0 followed by a 1 (the start frame), reads the next
+nine frames and delivers the byte if the stop frame is 0. The next byte may
+follow immediately. A bad stop frame is a framing error, a lost frame an
+interrupted byte; after either, ten 0 frames in a row (the longest run inside a
+byte is nine) must pass before a start is accepted, so the leftovers of a
+broken byte are never read as a new one. A one-frame glitch on an idle line is
+a valid `0xFF`, as on any UART. The Python output has no alternatives
+(`'MIDI', byte, []`).
+
+### `idle high` and `idle low`: a sampled 31250 baud UART
 
 Assumption: the MIDI bit, read once per frame, is the line of a 31250 baud 8N1
-UART (idle high, LSB first). `idle low` inverts the bit first.
+UART (idle high, LSB first). `idle low` inverts the bit first. This is the
+scheme the driver `rp1-adat` used before it gained the frame-bit scheme.
 
 A frame (20.8 us at 48 kHz) is shorter than a UART bit (32 us) by only a factor
 of 1.5, so the bytes cannot always be recovered uniquely. The decoder finds

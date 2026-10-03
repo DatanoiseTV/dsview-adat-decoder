@@ -90,6 +90,8 @@ class Export(unittest.TestCase):
         np.testing.assert_array_equal(
             self.ffmpeg_samples(self.p('out.wav'), 8), self.expected(frames))
 
+    @unittest.skipIf(sys.version_info < (3, 12),
+                     'wave reads WAVE_FORMAT_EXTENSIBLE from 3.12')
     def test_wav_read_back_by_python_wave(self):
         frames = random_frames(12, 2)
         cap = self.capture(frames)
@@ -137,6 +139,8 @@ class Export(unittest.TestCase):
         self.assertEqual([int(x) for x in row[12:16]],
                          flags['first sent = bit 3'])
 
+    @unittest.skipIf(sys.version_info < (3, 12),
+                     'wave reads WAVE_FORMAT_EXTENSIBLE from 3.12')
     def test_split_wavs_match_channels(self):
         frames = random_frames(10, 3)
         cap = self.capture(frames)
@@ -245,6 +249,8 @@ class Export(unittest.TestCase):
         np.testing.assert_array_equal(np.load(self.p('r.npy')),
                                       self.expected(frames))
 
+    @unittest.skipIf(sys.version_info < (3, 12),
+                     'wave reads WAVE_FORMAT_EXTENSIBLE from 3.12')
     def test_wav_rate_follows_the_stream(self):
         self.assertEqual(ex.nominal_rate(47980.0), 48000)
         self.assertEqual(ex.nominal_rate(44123.0), 44100)

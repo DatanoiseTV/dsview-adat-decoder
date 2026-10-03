@@ -123,13 +123,19 @@ class Export(unittest.TestCase):
         frames = [([0] * 8, 0b1000)] * 5
         cap = self.capture(frames)
         flags = {}
-        for order in ('first sent = bit 0', 'first sent = bit 3'):
+        for order in ('first sent = bit 3', 'first sent = bit 0'):
             self.run_export(cap, '--channel', '2', '--format', 'csv',
                             '--user-order', order, '-o', self.p('u'))
             row = self.read(self.p('u.csv')).splitlines()[1].split(',')
             flags[order] = [int(x) for x in row[12:16]]
-        self.assertEqual(flags['first sent = bit 0'], [1, 0, 0, 0])
         self.assertEqual(flags['first sent = bit 3'], [0, 0, 0, 1])
+        self.assertEqual(flags['first sent = bit 0'], [1, 0, 0, 0])
+        # No option given: the same as the decoder's default.
+        self.run_export(cap, '--channel', '2', '--format', 'csv', '-o',
+                        self.p('u'))
+        row = self.read(self.p('u.csv')).splitlines()[1].split(',')
+        self.assertEqual([int(x) for x in row[12:16]],
+                         flags['first sent = bit 3'])
 
     def test_split_wavs_match_channels(self):
         frames = random_frames(10, 3)
@@ -164,10 +170,10 @@ class Export(unittest.TestCase):
         self.assertEqual([int(x) for x in first[3:11]], list(want[0]))
         user = int(first[11])
         self.assertEqual(user, frames[0][1])
-        # flags follow the default order: timecode, midi, smux, reserved
+        # flags are the bits of the user value: timecode, midi, smux, reserved
         self.assertEqual([int(x) for x in first[12:16]],
-                         [(user >> 3) & 1, (user >> 2) & 1, (user >> 1) & 1,
-                          user & 1])
+                         [user & 1, (user >> 1) & 1, (user >> 2) & 1,
+                          (user >> 3) & 1])
         times = [float(r.split(',')[2]) for r in rows[1:]]
         self.assertTrue(all(b > a for a, b in zip(times, times[1:])))
         self.assertAlmostEqual(times[1] - times[0], 1 / 48000, delta=2e-7)

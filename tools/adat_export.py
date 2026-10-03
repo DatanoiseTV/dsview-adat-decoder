@@ -392,8 +392,8 @@ def main(argv=None):
     ap.add_argument('--rate', default='auto',
                     choices=('auto', '32 kHz', '44.1 kHz', '48 kHz'),
                     help='decoder start value for the frame rate')
-    ap.add_argument('--user-order', default='first sent = bit 0',
-                    choices=('first sent = bit 0', 'first sent = bit 3'))
+    ap.add_argument('--user-order', default='first sent = bit 3',
+                    choices=('first sent = bit 3', 'first sent = bit 0'))
     ap.add_argument('--midi', default='off',
                     choices=('off', 'idle high', 'idle low'),
                     help='experimental MIDI user-bit decoding, listed in the '

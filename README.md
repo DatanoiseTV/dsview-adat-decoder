@@ -30,8 +30,8 @@ Restart DSView, add the decoder "ADAT" and assign the receiver output to
     value only seeds the first sync search (accepts about +-27 %).
   - Sample format: hex, signed decimal, or both. Every sample also shows its
     level in dBFS.
-  - User bit order: `first sent = bit 0` (default) or `first sent = bit 3`.
-    See "User bits" below, the wire order is not documented anywhere I found.
+  - User bit order: `first sent = bit 3` (default, the nibble goes out MSB
+    first) or `first sent = bit 0`. See "User bits" below.
   - MIDI bit as 31250 baud UART (experimental): `off` (default),
     `idle high`, `idle low`.
   - Show individual bits: one annotation per bit, 256 per frame. Off by
@@ -61,14 +61,27 @@ verification.
 
 ## User bits
 
-Each frame carries four user bits. Public descriptions name them: timecode
-transport, MIDI transport, S/MUX indication, and a reserved bit that should be
-0. They are decoded per frame and shown as four cells. What is not documented
-anywhere I could find, and therefore not verified: which one is sent first
-(hence the `User bit order` option; the default assumes they are sent in the
-order timecode, MIDI, S/MUX, reserved), and how timecode and MIDI data are
-spread over successive frames. No timecode decoding is attempted beyond the
-bit value.
+Each frame carries four user bits. They are the bits of a 4-bit value that is
+sent MSB first, like every other nibble in the frame: bit 0 timecode
+transport, bit 1 MIDI transport, bit 2 S/MUX indication, bit 3 reserved (0).
+They are shown as four cells, in the order they are sent (reserved, S/MUX,
+MIDI, timecode).
+
+The order comes from source code, not from a hardware measurement:
+
+- XMOS `lib_adat` (`adat_tx_port.xc`) transmits the S/MUX 2 header with user
+  bits `0100` and no S/MUX with `0000`: the flag is the second bit sent, which
+  is bit 2 of the value, the S/MUX bit in the bit numbering above.
+- `amaranth-farm/adat-core` builds the header word `0b100000000001uuuu` and
+  sends it MSB first, so `u[3]` leads.
+
+The first version of this decoder assumed bit 0 first. A user report (their
+MIDI line was labelled S/MUX) led to checking those two sources, which agree
+with each other and contradict that guess. The old reading is still available
+as `User bit order = first sent = bit 0`. Equipment from another vendor is
+what would settle it. How timecode and MIDI data are spread over successive
+frames is not documented in anything I found; no timecode decoding is
+attempted beyond the bit value.
 
 ### MIDI over the user bit (experimental, off by default)
 

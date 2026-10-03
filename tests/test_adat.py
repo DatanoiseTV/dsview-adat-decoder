@@ -18,8 +18,9 @@ ANN, PY = srd.OUTPUT_ANN, srd.OUTPUT_PYTHON
 
 
 def options(**kw):
-    o = {'rate': 'auto', 'format': 'hex+signed', 'bits': 'no',
-         'user_order': 'first sent = bit 0', 'midi_uart': 'off'}
+    # Defaults come from the decoder's own option table, i.e. what DSView
+    # uses, so a changed default cannot go unnoticed.
+    o = {opt['id']: opt['default'] for opt in Decoder.options}
     o.update(kw)
     return o
 
@@ -232,60 +233,87 @@ class UserBits(unittest.TestCase):
         return [d[1] for ss, es, out, d in puts
                 if out == PY and d[0] == 'FLAGS']
 
-    def test_flags_default_order(self):
-        # User nibble is sent MSB first: sent[0]=timecode, [1]=MIDI,
-        # [2]=S/MUX, [3]=reserved under 'first sent = bit 0'.
-        users = [0b1000, 0b0100, 0b0010, 0b0001, 0b0000, 0b1111, 0b0110]
+    def test_declared_defaults(self):
+        self.assertEqual(options(), {
+            'rate': 'auto', 'user_order': 'first sent = bit 3',
+            'format': 'hex+signed', 'midi_uart': 'off', 'bits': 'no'})
+        for opt in Decoder.options:
+            self.assertIn(opt['default'], opt['values'], opt['id'])
+
+    def test_flags_are_the_bits_of_the_user_value(self):
+        # The nibble is a value sent MSB first: bit 0 timecode, bit 1 MIDI,
+        # bit 2 S/MUX, bit 3 reserved.
+        users = [0b0001, 0b0010, 0b0100, 0b1000, 0b0000, 0b1111, 0b0110]
         got = self.flags(self.run_user(users))
         names = ('timecode', 'midi', 'smux', 'reserved')
-        want = [dict(zip(names, [(u >> 3) & 1, (u >> 2) & 1,
-                                 (u >> 1) & 1, u & 1])) for u in users[:-1]]
+        want = [dict(zip(names, [u & 1, (u >> 1) & 1, (u >> 2) & 1,
+                                 (u >> 3) & 1])) for u in users[:-1]]
         self.assertEqual(got, want)
 
-    def test_flags_reversed_order_option(self):
+    def test_xmos_smux_header_is_smux(self):
+        # lib_adat adat_tx_port.xc: the S/MUX 2 header carries user bits
+        # 0100 (second bit sent), no S/MUX 0000. Under the other reading the
+        # 0100 would be MIDI-then-nothing: bit 2 sent first is bit 1 = MIDI.
+        got = self.flags(self.run_user([0b0100] * 3))[0]
+        self.assertEqual((got['smux'], got['midi'], got['timecode'],
+                          got['reserved']), (1, 0, 0, 0))
+        puts = self.run_user([0b0100] * 3)
+        self.assertTrue(anns(puts, FRAME)[0][2][0].endswith(', S/MUX'))
+        got = self.flags(self.run_user([0b0000] * 3))[0]
+        self.assertEqual(sum(got.values()), 0)
+
+    def test_header_matches_the_amaranth_word(self):
+        # adat-core transmitter: header = 0b100000000001uuuu, MSB first.
+        for u in (0b0000, 0b0100, 0b1010):
+            word = (1 << 15) | (1 << 4) | u
+            self.assertEqual(sig.frame_bits([0] * 8, u)[:16],
+                             [(word >> (15 - k)) & 1 for k in range(16)])
+
+    def test_flags_opposite_order_option(self):
         users = [0b1000, 0b0100, 0b0010, 0b0001, 0]
-        got = self.flags(self.run_user(users, user_order='first sent = bit 3'))
+        got = self.flags(self.run_user(users, user_order='first sent = bit 0'))
         self.assertEqual([[g[n] for n in ('timecode', 'midi', 'smux',
                                           'reserved')] for g in got],
-                         [[0, 0, 0, 1], [0, 0, 1, 0],
-                          [0, 1, 0, 0], [1, 0, 0, 0]])
+                         [[1, 0, 0, 0], [0, 1, 0, 0],
+                          [0, 0, 1, 0], [0, 0, 0, 1]])
 
     def test_flag_annotations_sit_on_their_bit_cells(self):
+        # 0b1010: reserved=1 and MIDI=1; sent order is bit 3, 2, 1, 0.
         levels, bt = sig.stream([([0] * 8, 0b1010)] * 3, self.SR, 48000)
         puts = decode(levels, self.SR)
-        for cls, pos, text in ((A_TIMECODE, 12, 'Timecode: 1'),
-                               (A_MIDI, 13, 'MIDI: 0'),
-                               (A_SMUX, 14, 'S/MUX: 1'),
-                               (A_RESERVED, 15, 'Reserved: 0')):
+        for cls, pos, text in ((A_RESERVED, 12, 'Reserved: 1 (expected 0)'),
+                               (A_SMUX, 13, 'S/MUX: 0'),
+                               (A_MIDI, 14, 'MIDI: 1'),
+                               (A_TIMECODE, 15, 'Timecode: 0')):
             ss, es, t = anns(puts, cls)[0]
             self.assertEqual(t[0], text)
             self.assertAlmostEqual(ss, bt(pos), delta=2.5)
             self.assertAlmostEqual(es, bt(pos + 1), delta=2.5)
 
     def test_flag_cells_follow_the_order_option(self):
-        # 'first sent = bit 3': timecode is the last of the four cells.
+        # 'first sent = bit 0': timecode is the first of the four cells.
         levels, bt = sig.stream([([0] * 8, 0b1000)] * 3, self.SR, 48000)
-        puts = decode(levels, self.SR, user_order='first sent = bit 3')
-        for cls, pos, text in ((A_TIMECODE, 15, 'Timecode: 0'),
-                               (A_MIDI, 14, 'MIDI: 0'),
-                               (A_SMUX, 13, 'S/MUX: 0'),
-                               (A_RESERVED, 12, 'Reserved: 1 (expected 0)')):
+        puts = decode(levels, self.SR, user_order='first sent = bit 0')
+        for cls, pos, text in ((A_TIMECODE, 12, 'Timecode: 1'),
+                               (A_MIDI, 13, 'MIDI: 0'),
+                               (A_SMUX, 14, 'S/MUX: 0'),
+                               (A_RESERVED, 15, 'Reserved: 0')):
             ss, es, t = anns(puts, cls)[0]
             self.assertEqual(t[0], text)
             self.assertAlmostEqual(ss, bt(pos), delta=2.5)
 
     def test_reserved_bit_set_is_called_out(self):
-        puts = self.run_user([0b0001] * 3)
+        puts = self.run_user([0b1000] * 3)
         self.assertEqual(anns(puts, A_RESERVED)[0][2][0],
                          'Reserved: 1 (expected 0)')
 
     def test_smux_shown_in_frame_and_user_summary(self):
-        puts = self.run_user([0b0010] * 3)
+        puts = self.run_user([0b0100] * 3)
         self.assertTrue(anns(puts, FRAME)[0][2][0].endswith(', S/MUX'))
-        self.assertEqual(anns(puts, USER)[0][2][0], 'User 0x2: SMUX')
-        puts = self.run_user([0b1100] * 3)
+        self.assertEqual(anns(puts, USER)[0][2][0], 'User 0x4: SMUX')
+        puts = self.run_user([0b0011] * 3)
         self.assertNotIn('S/MUX', anns(puts, FRAME)[0][2][0])
-        self.assertEqual(anns(puts, USER)[0][2][0], 'User 0xC: TC MIDI')
+        self.assertEqual(anns(puts, USER)[0][2][0], 'User 0x3: TC MIDI')
         self.assertEqual(anns(self.run_user([0] * 3), USER)[0][2][0],
                          'User 0x0: none')
 

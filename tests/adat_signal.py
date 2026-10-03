@@ -82,8 +82,8 @@ def midi_frames(data, fs, phase, gap_bits=2, lead=6, seed=1, invert=False,
                 stop=1):
     """Frames whose MIDI user bit carries `data` as a 31250 baud 8N1 UART,
     sampled once per frame. phase (0..1) is where the first start edge falls
-    inside a frame cell. The MIDI flag is the second bit sent in the user
-    nibble, i.e. bit 2 of the nibble value."""
+    inside a frame cell. The MIDI flag is bit 1 of the user nibble value,
+    which is the third bit sent (the nibble goes out MSB first)."""
     baud = 31250.0
     start = (lead + phase) / fs
     segs = []
@@ -105,7 +105,7 @@ def midi_frames(data, fs, phase, gap_bits=2, lead=6, seed=1, invert=False,
         if invert:
             m = 1 - m
         frames.append(([rng.randint(-2 ** 23, 2 ** 23 - 1) for _ in range(8)],
-                       m << 2))
+                       m << 1))
     return frames
 
 

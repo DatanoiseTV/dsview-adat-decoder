@@ -69,9 +69,14 @@ BOOT_MAX_US = 1.60
 # Fewer samples per bit cell than this cannot be rounded to cells reliably.
 MIN_SAMPLES_PER_BIT = 4.0
 
-# The four user bits of a frame. Public descriptions name them (timecode
-# transport, MIDI transport, S/MUX indication, reserved = 0) but do not state
-# the order they are sent in, hence the 'user_order' option.
+# The four user bits of a frame: bit 0 timecode transport, bit 1 MIDI
+# transport, bit 2 S/MUX indication, bit 3 reserved = 0 (Wikipedia, ADAT
+# Lightpipe). The nibble is a value sent MSB first like every other nibble,
+# so bit 3 goes out first. Evidence, all from source code, none measured on
+# hardware: lib_adat (XMOS) transmits S/MUX 2 with user bits 0100, the second
+# bit sent, which is bit 2; amaranth-farm/adat-core builds the header word
+# 0b100000000001uuuu, sent MSB first, so u[3] leads. The 'user_order' option
+# keeps the opposite reading available.
 FLAG_NAMES = ('timecode', 'midi', 'smux', 'reserved')
 FLAG_LABELS = ('Timecode', 'MIDI', 'S/MUX', 'Reserved')
 FLAG_SHORT = ('TC', 'MIDI', 'SMUX', 'Rsvd')
@@ -123,8 +128,8 @@ class Decoder(srd.Decoder):
             'values': ('hex', 'signed', 'hex+signed'),
             'idn': 'dec_adat_opt_format'},
         {'id': 'user_order', 'desc': 'User bit order',
-            'default': 'first sent = bit 0',
-            'values': ('first sent = bit 0', 'first sent = bit 3'),
+            'default': 'first sent = bit 3',
+            'values': ('first sent = bit 3', 'first sent = bit 0'),
             'idn': 'dec_adat_opt_user_order'},
         {'id': 'midi_uart', 'desc': 'MIDI bit as 31250 baud UART (experimental)',
             'default': 'off', 'values': ('off', 'idle high', 'idle low'),

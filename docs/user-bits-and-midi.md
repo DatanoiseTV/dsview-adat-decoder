@@ -17,7 +17,9 @@ S/MUX, MIDI, timecode.
 
 ### Where the order comes from
 
-The order comes from source code, not from a hardware measurement:
+The order comes from source code. A hardware capture decodes the nibble as
+`0x2` and labels it MIDI under the default order, which fits those sources, but
+what the device was sending is not recorded, so it is not a confirmation:
 
 - XMOS `lib_adat` (`adat_tx_port.xc`) transmits the S/MUX 2 header with user
   bits `0100` and no S/MUX with `0000`. The flag is the second bit sent, which

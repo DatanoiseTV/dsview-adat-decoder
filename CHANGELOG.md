@@ -7,8 +7,9 @@ decoder's annotations or Python output.
 
 ## [0.1.0] - 2026-10-03
 
-First public release. Tested on synthetic streams only; see the README for
-what is unverified against hardware.
+First public release. Frame sync, rate tracking and user nibble confirmed on
+real hardware (DSLogic Plus, DSView 1.3.2); sample bit order and channel order
+not yet, because the capture was silent. See the README.
 
 ### Added
 

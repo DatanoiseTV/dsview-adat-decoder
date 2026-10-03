@@ -12,18 +12,23 @@ DSView embeds.
 
 ## Status
 
-Tested on synthetic streams only. The test generator and the decoder share one
-author's reading of the format, so these points are unverified against real
-hardware:
+Run on real hardware: a DSLogic Plus in DSView 1.3.2 locked on two ADAT inputs
+at about 47.98 kHz (12.283 Mbit/s), tracked the frame rate frame to frame, and
+produced about 76,000 annotation items from one capture, including the user
+nibble (shown as `User 0x2: MIDI`).
+
+The rest was developed against streams from the test generator, which shares
+one author's reading of the format with the decoder. That capture had silent
+audio (all samples 0, -inf dBFS), so it does not settle:
 
 - MSB-first bit order within a sample
 - channel order (channel 1 first)
 - order of the four user bits (see [user bits and MIDI](docs/user-bits-and-midi.md))
-- the `.dsl` file layout read by the exporter (taken from DSView's source, not
+- the `.dsl` layout read by the exporter (taken from DSView's source, not
   from a real file)
 
-A capture from an ADAT device would settle all four. If you have one, see
-[Contributing](CONTRIBUTING.md); it is the most useful thing you can send.
+A capture with a known test signal (a sine on one channel, silence on the
+others) would settle the first two. See [Contributing](CONTRIBUTING.md).
 
 ## What it decodes
 

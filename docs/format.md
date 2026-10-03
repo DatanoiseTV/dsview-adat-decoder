@@ -2,8 +2,9 @@
 
 This is what `adat/pd.py` decodes. It was checked against public descriptions
 for the 256-bit total, the 11-bit sync, the 16-bit header plus 8 x 30-bit
-words, and the NRZI line code. It has not been checked against a hardware
-capture; see [Status](../README.md#status).
+words, and the NRZI line code. Frame sync and rate tracking have been seen working on a
+real device; sample bit order and channel order have not been confirmed with
+non-silent audio. See [Status](../README.md#status).
 
 ## Line code
 

@@ -35,9 +35,10 @@ the exporter each turn at least one test red.
 
 The generator in `tests/adat_signal.py` and the decoder were written from the
 same understanding of the format. A test passing means the decoder agrees with
-the generator, not that either agrees with an ADAT device. The unverified
-points are listed in [Status](../README.md#status): bit order, channel order,
-user bit order, and the `.dsl` layout. Tests for these will become meaningful
+the generator, not that either agrees with an ADAT device. Sync and rate
+tracking were seen on hardware; the points still open are listed in
+[Status](../README.md#status): bit order, channel order, user bit order, and
+the `.dsl` layout. Tests for these will become meaningful
 only once a real capture exists to compare against.
 
 ## Python 3.7

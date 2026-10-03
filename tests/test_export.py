@@ -261,13 +261,25 @@ class Export(unittest.TestCase):
             self.assertEqual(w.getframerate(), 96000)
 
     def test_midi_and_user_flags_are_reported(self):
-        frames = sig.midi_frames([0x55, 0xAA, 0x55], 48000, 0.2, gap_bits=4)
+        # Note On ch6 C#6 vel 85, then Channel Pressure ch6 = 85.
+        data = [0x95, 0x55, 0x55, 0xD5, 0x55]
+        frames = sig.midi_frames(data, 48000, 0.2, gap_bits=4)
         cap = self.capture(frames)
         self.run_export(cap, '--channel', '2', '--midi', 'idle high', '-o',
                         self.p('m'), '--json', self.p('m.json'))
         rep = json.loads(self.read(self.p('m.json')))
-        self.assertEqual([m['byte'] for m in rep['midi_bytes']],
-                         [0x55, 0xAA, 0x55])
+        self.assertEqual([m['byte'] for m in rep['midi_bytes']], data)
+        self.assertEqual([e['text'] for e in rep['midi_events']],
+                         ['Note On ch6 C#6 (85) vel 85',
+                          'Channel Pressure ch6 = 85'])
+        self.assertEqual([e['bytes'] for e in rep['midi_events']],
+                         [[0x95, 0x55, 0x55], [0xD5, 0x55]])
+        self.assertFalse(any(e['ambiguous'] for e in rep['midi_events']))
+        t = [e['time_s'] for e in rep['midi_events']]
+        # Seconds from the start of the capture: the first byte starts about
+        # 6 frames in (125 us), the whole burst is a few milliseconds.
+        self.assertTrue(0 < t[0] < 0.002 and t[0] < t[1] < 0.01, t)
+        self.assertIn('Note On ch6 C#6 (85) vel 85', self.last_output)
         self.assertGreater(rep['user_bit_frames']['midi'], 0)
         self.assertEqual(rep['user_bit_frames']['smux'], 0)
 

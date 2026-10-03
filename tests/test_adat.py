@@ -11,7 +11,7 @@ import sigrokdecode as srd
 from adat.pd import (Decoder, A_SYNC as SYNC, A_USER as USER,
                      A_FRAME as FRAME, A_ERROR as ERROR, A_BIT as BIT,
                      A_MARKER as MARKER, A_TIMECODE, A_MIDI, A_SMUX,
-                     A_RESERVED, A_CH0, A_MIDIBYTE)
+                     A_RESERVED, A_CH0, A_MIDIBYTE, A_MIDIEVENT)
 import adat_signal as sig
 
 ANN, PY = srd.OUTPUT_ANN, srd.OUTPUT_PYTHON
@@ -396,7 +396,8 @@ class MidiUart(unittest.TestCase):
 
     def test_bad_stop_bit_is_a_framing_error(self):
         data = [0x55, 0x55, 0x55]
-        frames = sig.midi_frames(data, 48000, 0.2, stop=0)
+        # 14 idle bits: after a framing error the decoder waits for 10.
+        frames = sig.midi_frames(data, 48000, 0.2, stop=0, gap_bits=14)
         levels, _ = sig.stream(frames, self.SR, 48000)
         puts = decode(levels, self.SR, midi_uart='idle high')
         errs = [t[0] for ss, es, t in anns(puts, ERROR)]
@@ -405,6 +406,28 @@ class MidiUart(unittest.TestCase):
         self.assertTrue(all(e == 'MIDI framing error' for e in errs), errs)
         # Each bad byte is one error, not one per low frame of its stop bit.
         self.assertEqual(len(errs), len(data))
+
+    def test_capture_starting_mid_byte_waits_for_a_falling_edge(self):
+        # The line is already low in the first frames. A start bit is a
+        # high-to-low edge, not just a low sample.
+        frames = sig.midi_frames([0x55], 48000, 0.2, gap_bits=14, lead=14)
+        frames = [(s, 0) for s, _ in frames[:4]] + frames[4:]
+        levels, _ = sig.stream(frames, self.SR, 48000)
+        puts = decode(levels, self.SR, midi_uart='idle high')
+        self.assertEqual(self.midi(puts), [(0x55, [])])
+        self.assertEqual(anns(puts, ERROR), [])
+
+    def test_framing_error_waits_for_idle_before_the_next_byte(self):
+        # With bad stop bits and no idle between bytes the low stop bit looks
+        # like a start bit; decoding on would invent a 0xFF. One error, then
+        # silence, rather than a phantom byte.
+        frames = sig.midi_frames([0x55, 0x55, 0x55], 48000, 0.2, stop=0,
+                                 gap_bits=0)
+        levels, _ = sig.stream(frames, self.SR, 48000)
+        puts = decode(levels, self.SR, midi_uart='idle high')
+        self.assertEqual(self.midi(puts), [])
+        self.assertEqual([t[0] for ss, es, t in anns(puts, ERROR)],
+                         ['MIDI framing error'])
 
     def test_damaged_frame_interrupts_the_byte_in_flight(self):
         data = [0x55, 0x55, 0x55]
@@ -485,6 +508,211 @@ class MidiUart(unittest.TestCase):
         puts = self.run_midi([0x55, 0x55], phase=0.4)
         ss, es, _ = anns(puts, A_MIDIBYTE)[0]
         self.assertAlmostEqual(es - ss, 10 * self.SR / 31250.0, delta=2000)
+
+
+class MidiEvents(unittest.TestCase):
+    """The message assembler, fed bytes directly so ambiguity and timing of
+    the UART layer play no part."""
+    BIT = 3200      # one UART bit at 100 MS/s
+
+    def feed(self, stream):
+        """stream: bytes, or (byte, ambiguous) pairs. Returns the event
+        annotations as (start, end, long text) and the Python packets."""
+        d = Decoder()
+        d.puts = []
+        d.options = options(midi_uart='idle high')
+        d.metadata(srd.SRD_CONF_SAMPLERATE, 100_000_000)
+        d.start()
+        for i, b in enumerate(stream):
+            byte, amb = b if isinstance(b, tuple) else (b, False)
+            d.midi_event_feed(i * 10 * self.BIT, (i + 1) * 10 * self.BIT - 1,
+                              byte, amb)
+        ev = [(ss, es, t[0]) for ss, es, t in anns(d.puts, A_MIDIEVENT)]
+        pk = [x[3][1] for x in d.puts if x[2] == PY and x[3][0] == 'MIDI_EVENT']
+        return ev, pk
+
+    def texts(self, stream):
+        return [t for ss, es, t in self.feed(stream)[0]]
+
+    def test_the_lane_exists(self):
+        rows = {r[0]: r[2] for r in Decoder.annotation_rows}
+        self.assertEqual(rows['midi_events'], (A_MIDIEVENT,))
+        self.assertEqual(rows['midi'], (A_MIDIBYTE,))
+        self.assertNotEqual(A_MIDIEVENT, A_MIDIBYTE)
+
+    def test_note_on_off_with_names(self):
+        self.assertEqual(self.texts([0x90, 60, 100]),
+                         ['Note On ch1 C4 (60) vel 100'])
+        self.assertEqual(self.texts([0x8F, 69, 0]),
+                         ['Note Off ch16 A4 (69) vel 0'])
+        self.assertEqual(self.texts([0x93, 61, 0]),
+                         ['Note Off ch4 C#4 (61) vel 0 (note on, vel 0)'])
+
+    def test_event_spans_the_whole_message(self):
+        ev, pk = self.feed([0x90, 60, 100])
+        self.assertEqual(ev, [(0, 3 * 10 * self.BIT - 1,
+                               'Note On ch1 C4 (60) vel 100')])
+        self.assertEqual(pk, [{'bytes': [0x90, 60, 100], 'ambiguous': False,
+                               'text': 'Note On ch1 C4 (60) vel 100'}])
+
+    def test_running_status_starts_at_the_first_data_byte(self):
+        ev, _ = self.feed([0x90, 60, 100, 62, 90, 64, 80])
+        self.assertEqual([t for _, _, t in ev],
+                         ['Note On ch1 C4 (60) vel 100',
+                          'Note On ch1 D4 (62) vel 90',
+                          'Note On ch1 E4 (64) vel 80'])
+        self.assertEqual([s for s, _, _ in ev],
+                         [0, 3 * 10 * self.BIT, 5 * 10 * self.BIT])
+
+    def test_control_change_names_and_unnamed(self):
+        self.assertEqual(self.texts([0xB2, 7, 100]),
+                         ['CC7 Volume ch3 = 100'])
+        self.assertEqual(self.texts([0xB0, 64, 127]),
+                         ['CC64 Sustain ch1 = 127'])
+        self.assertEqual(self.texts([0xB0, 3, 5]), ['CC3 ch1 = 5'])
+        self.assertEqual(self.texts([0xB0, 123, 0]),
+                         ['CC123 All Notes Off ch1 = 0'])
+
+    def test_one_data_byte_messages(self):
+        self.assertEqual(self.texts([0xC5, 12]),
+                         ['Program Change ch6 -> 12'])
+        self.assertEqual(self.texts([0xD1, 40]),
+                         ['Channel Pressure ch2 = 40'])
+        self.assertEqual(self.texts([0xC0, 1, 2, 3]),
+                         ['Program Change ch1 -> 1', 'Program Change ch1 -> 2',
+                          'Program Change ch1 -> 3'])
+
+    def test_pitch_bend_is_fourteen_bit_centred(self):
+        self.assertEqual(self.texts([0xE0, 0x00, 0x40]), ['Pitch Bend ch1 +0'])
+        self.assertEqual(self.texts([0xE0, 0x7F, 0x7F]),
+                         ['Pitch Bend ch1 +8191'])
+        self.assertEqual(self.texts([0xE0, 0x00, 0x00]),
+                         ['Pitch Bend ch1 -8192'])
+        self.assertEqual(self.texts([0xE0, 0x01, 0x41]),
+                         ['Pitch Bend ch1 +129'])
+
+    def test_poly_pressure(self):
+        self.assertEqual(self.texts([0xA0, 60, 33]),
+                         ['Poly Pressure ch1 C4 (60) = 33'])
+
+    def test_realtime_bytes_pass_through_a_message(self):
+        ev, _ = self.feed([0x90, 0xF8, 60, 0xF8, 100, 0xFA])
+        self.assertEqual([t for _, _, t in ev],
+                         ['Clock', 'Clock', 'Note On ch1 C4 (60) vel 100',
+                          'Start'])
+        # The note spans from its status byte to its last data byte.
+        self.assertEqual((ev[2][0], ev[2][1]), (0, 5 * 10 * self.BIT - 1))
+
+    def test_realtime_names(self):
+        self.assertEqual(self.texts([0xF8, 0xFA, 0xFB, 0xFC, 0xFE, 0xFF]),
+                         ['Clock', 'Start', 'Continue', 'Stop',
+                          'Active Sensing', 'System Reset'])
+
+    def test_system_common(self):
+        self.assertEqual(self.texts([0xF2, 0x01, 0x02]),
+                         ['Song Position 257'])
+        self.assertEqual(self.texts([0xF3, 5]), ['Song Select 5'])
+        self.assertEqual(self.texts([0xF6]), ['Tune Request'])
+        self.assertEqual(self.texts([0xF1, 0x34]),
+                         ['MTC Quarter Frame type 3 value 4'])
+
+    def test_system_common_cancels_running_status(self):
+        self.assertEqual(self.texts([0x90, 60, 100, 0xF3, 5, 60, 100]),
+                         ['Note On ch1 C4 (60) vel 100', 'Song Select 5',
+                          'Data 0x3C without status', 'Data 0x64 without status'])
+
+    def test_sysex(self):
+        self.assertEqual(self.texts([0xF0, 0x41, 0x10, 0x42, 0x12, 0xF7]),
+                         ['SysEx Roland (4 bytes)'])
+        ev, pk = self.feed([0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7])
+        self.assertEqual(ev[0][2], 'SysEx Universal Non-Realtime (4 bytes)')
+        self.assertEqual((ev[0][0], ev[0][1]), (0, 6 * 10 * self.BIT - 1))
+        self.assertEqual(pk[0]['bytes'], [0xF0, 0x7E, 0x7F, 0x06])
+        self.assertEqual(self.texts([0xF0, 0xF7]), ['SysEx (0 bytes)'])
+
+    def test_sysex_cut_short_by_a_status_byte(self):
+        ev = self.texts([0xF0, 0x41, 0x10, 0x90, 60, 100])
+        self.assertEqual(ev, ['SysEx Roland (2 bytes) cut short',
+                              'Note On ch1 C4 (60) vel 100'])
+
+    def test_realtime_inside_sysex_does_not_end_it(self):
+        self.assertEqual(self.texts([0xF0, 0x43, 0xF8, 0x10, 0xF7]),
+                         ['Clock', 'SysEx Yamaha (2 bytes)'])
+
+    def test_stray_data_and_stray_sysex_end(self):
+        self.assertEqual(self.texts([0x40]), ['Data 0x40 without status'])
+        self.assertEqual(self.texts([0xF7]), ['SysEx End'])
+
+    def test_a_new_status_drops_an_unfinished_message(self):
+        self.assertEqual(self.texts([0x90, 60, 0x80, 60, 0]),
+                         ['Note Off ch1 C4 (60) vel 0'])
+
+    def test_ambiguous_byte_marks_the_event(self):
+        ev, pk = self.feed([0x90, (60, True), 100])
+        self.assertEqual(ev[0][2], 'Note On ch1 C4 (60) vel 100 ?')
+        self.assertTrue(pk[0]['ambiguous'])
+        ev, _ = self.feed([0x90, 60, 100, (62, True), 90, 64, 80])
+        self.assertEqual([t.endswith(' ?') for _, _, t in ev],
+                         [False, True, False])
+
+    def test_parser_reset_forgets_running_status(self):
+        d = Decoder()
+        d.puts = []
+        d.options = options(midi_uart='idle high')
+        d.metadata(srd.SRD_CONF_SAMPLERATE, 100_000_000)
+        d.start()
+        for i, b in enumerate([0x90, 60, 100]):
+            d.midi_event_feed(i * 3200, i * 3200 + 3199, b, False)
+        d.midi_parser_reset()           # what a lost byte does
+        d.midi_event_feed(10000, 13199, 62, False)
+        self.assertEqual([t[0] for _, _, t in anns(d.puts, A_MIDIEVENT)],
+                         ['Note On ch1 C4 (60) vel 100',
+                          'Data 0x3E without status'])
+
+    def test_end_to_end_from_the_wire(self):
+        # Alternating-bit bytes decode exactly at every start phase.
+        msgs = ([0x95, 0x55, 0x55], 'Note On ch6 C#6 (85) vel 85'), \
+               ([0xD5, 0x55], 'Channel Pressure ch6 = 85'), \
+               ([0xB5, 0x55, 0x55], 'CC85 ch6 = 85')
+        for data, want in msgs:
+            for i in range(20):
+                frames = sig.midi_frames(data, 48000, i / 20, gap_bits=14)
+                levels, _ = sig.stream(frames, 100_000_000, 48000)
+                puts = decode(levels, 100_000_000, midi_uart='idle high')
+                got = [t[0] for ss, es, t in anns(puts, A_MIDIEVENT)]
+                self.assertEqual(got, [want], (data, i))
+                ev = anns(puts, A_MIDIEVENT)[0]
+                byts = anns(puts, A_MIDIBYTE)
+                self.assertEqual(ev[0], byts[0][0])
+                self.assertEqual(ev[1], byts[-1][1])
+
+    def test_a_lost_byte_forgets_running_status(self):
+        # Fourth byte has a bad stop bit. The two data bytes after it must
+        # not be taken as a continuation of the earlier Note On.
+        data = [0x95, 0x55, 0x55, 0x55, 0x55, 0x55]
+        frames = sig.midi_frames(data, 48000, 0.2, gap_bits=14,
+                                 stop=[1, 1, 1, 0, 1, 1])
+        levels, _ = sig.stream(frames, 100_000_000, 48000)
+        puts = decode(levels, 100_000_000, midi_uart='idle high')
+        self.assertEqual([t[0] for ss, es, t in anns(puts, A_MIDIEVENT)],
+                         ['Note On ch6 C#6 (85) vel 85',
+                          'Data 0x55 without status',
+                          'Data 0x55 without status'])
+
+    def test_events_off_when_midi_is_off(self):
+        frames = sig.midi_frames([0x95, 0x55, 0x55], 48000, 0.2, gap_bits=14)
+        levels, _ = sig.stream(frames, 100_000_000, 48000)
+        puts = decode(levels, 100_000_000, midi_uart='off')
+        self.assertEqual(anns(puts, A_MIDIEVENT), [])
+
+    def test_framing_error_drops_the_message_in_progress(self):
+        # Note On, then a byte with a bad stop bit, then a data byte that
+        # would be running status.
+        frames = sig.midi_frames([0x95, 0x55, 0x55], 48000, 0.2, gap_bits=14,
+                                 stop=0)
+        levels, _ = sig.stream(frames, 100_000_000, 48000)
+        puts = decode(levels, 100_000_000, midi_uart='idle high')
+        self.assertEqual(anns(puts, A_MIDIEVENT), [])
 
 
 class Faults(unittest.TestCase):

@@ -299,6 +299,7 @@ class Pipeline:
         self.errors = []
         self.error_count = 0
         self.midi = []
+        self.midi_events = []
         self.flag_counts = {'timecode': 0, 'midi': 0, 'smux': 0, 'reserved': 0}
         self.first = None
 
@@ -323,6 +324,8 @@ class Pipeline:
                 self.add_frame(self.pending)
         elif kind == 'MIDI':
             self.midi.append((ss, data[1], data[2]))
+        elif kind == 'MIDI_EVENT':
+            self.midi_events.append((ss, data[1]))
 
     def add_frame(self, f):
         ss = f['ss']
@@ -453,6 +456,10 @@ def main(argv=None):
         'user_bit_frames': pipe.flag_counts,
         'midi_bytes': [{'sample': s, 'byte': b, 'alternatives': a}
                        for s, b, a in pipe.midi],
+        'midi_events': [{'sample': s, 'time_s': s / samplerate,
+                         'text': e['text'], 'bytes': e['bytes'],
+                         'ambiguous': e['ambiguous']}
+                        for s, e in pipe.midi_events],
         'files': sinks.paths,
     }
     print_report(report)
@@ -504,7 +511,16 @@ def print_report(r):
         print('  sample %-12d %s' % (e['sample'], e['message']))
     print('user bit frames  ' + ', '.join('%s %d' % kv for kv in
                                           r['user_bit_frames'].items()))
-    if r['midi_bytes']:
+    if r['midi_events']:
+        print('MIDI events      %d (%d bytes)' % (len(r['midi_events']),
+                                                  len(r['midi_bytes'])))
+        for e in r['midi_events'][:30]:
+            print('  %10.6f s  %s%s' % (e['time_s'], e['text'],
+                                        '  ?' if e['ambiguous'] else ''))
+        if len(r['midi_events']) > 30:
+            print('  ... %d more in the --json report' %
+                  (len(r['midi_events']) - 30))
+    elif r['midi_bytes']:
         print('MIDI bytes       ' + ' '.join(
             '%02X%s' % (m['byte'], '?' if m['alternatives'] else '')
             for m in r['midi_bytes'][:40]))

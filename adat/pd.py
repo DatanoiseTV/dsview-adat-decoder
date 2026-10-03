@@ -31,6 +31,8 @@ Packet:
  - 'FLAGS', {'timecode': 0|1, 'midi': 0|1, 'smux': 0|1, 'reserved': 0|1}
  - 'MIDI', <byte>, [<alternatives>]  experimental, see the midi_uart option;
                                        alternatives is non-empty if the byte was ambiguous
+ - 'MIDI_EVENT', {'bytes': [..], 'text': str, 'ambiguous': bool}
+                                       one assembled MIDI message
 '''
 
 # Frame layout, 256 bit cells per frame (bit rate = 256 * frame rate):
@@ -88,6 +90,7 @@ FLAG_SHORT = ('TC', 'MIDI', 'SMUX', 'Rsvd')
 A_CH0 = 10
 A_FLAGS = (A_TIMECODE, A_MIDI, A_SMUX, A_RESERVED)
 A_MIDIBYTE = A_CH0 + 8
+A_MIDIEVENT = A_MIDIBYTE + 1
 
 # EXPERIMENTAL MIDI-over-ADAT: the MIDI user bit is read once per frame and
 # fed to a 31250 baud 8N1 UART (idle = 1, LSB first). This is an assumption,
@@ -98,11 +101,34 @@ MIDI_BAUD = 31250
 MIDI_STATUS = {0x80: 'Note Off', 0x90: 'Note On', 0xA0: 'Poly Aftertouch',
                0xB0: 'Control Change', 0xC0: 'Program Change',
                0xD0: 'Channel Aftertouch', 0xE0: 'Pitch Bend'}
-MIDI_SYSTEM = {0xF0: 'SysEx', 0xF7: 'SysEx End', 0xF8: 'Clock',
-               0xFA: 'Start', 0xFB: 'Continue', 0xFC: 'Stop',
-               0xFE: 'Active Sensing', 0xFF: 'Reset'}
+NOTE_NAMES = ('C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B')
+# Data bytes that follow a status byte; system common 0xF1.. use their own.
+MIDI_DATA_LEN = {0x80: 2, 0x90: 2, 0xA0: 2, 0xB0: 2, 0xC0: 1, 0xD0: 1,
+                 0xE0: 2, 0xF1: 1, 0xF2: 2, 0xF3: 1, 0xF4: 0, 0xF5: 0,
+                 0xF6: 0}
+MIDI_CC = {0: 'Bank Select', 1: 'Mod Wheel', 2: 'Breath', 4: 'Foot',
+           5: 'Portamento Time', 6: 'Data Entry', 7: 'Volume', 8: 'Balance',
+           10: 'Pan', 11: 'Expression', 32: 'Bank Select LSB',
+           38: 'Data Entry LSB', 64: 'Sustain', 65: 'Portamento',
+           66: 'Sostenuto', 67: 'Soft Pedal', 71: 'Resonance', 72: 'Release',
+           73: 'Attack', 74: 'Cutoff', 91: 'Reverb', 93: 'Chorus',
+           98: 'NRPN LSB', 99: 'NRPN MSB', 100: 'RPN LSB', 101: 'RPN MSB',
+           120: 'All Sound Off', 121: 'Reset Controllers', 122: 'Local Control',
+           123: 'All Notes Off', 124: 'Omni Off', 125: 'Omni On',
+           126: 'Mono On', 127: 'Poly On'}
+MIDI_MANUFACTURER = {0x7D: 'Educational', 0x7E: 'Universal Non-Realtime',
+                     0x7F: 'Universal Realtime', 0x41: 'Roland', 0x42: 'Korg',
+                     0x43: 'Yamaha', 0x47: 'Akai', 0x00: 'extended id'}
+MIDI_SYSTEM = {0xF0: 'SysEx', 0xF6: 'Tune Request', 0xF7: 'SysEx End',
+               0xF8: 'Clock', 0xFA: 'Start', 0xFB: 'Continue', 0xFC: 'Stop',
+               0xFE: 'Active Sensing', 0xFF: 'System Reset'}
 
 RATES = {'auto': None, '32 kHz': 32000, '44.1 kHz': 44100, '48 kHz': 48000}
+
+def midi_data_len(status):
+    """Data bytes that follow a channel or system common status byte."""
+    return MIDI_DATA_LEN[status & 0xF0 if status < 0xF0 else status]
+
 
 class SamplerateError(Exception):
     pass
@@ -157,12 +183,14 @@ class Decoder(srd.Decoder):
         ('ch7', 'Channel 7'),
         ('ch8', 'Channel 8'),
         ('midibyte', 'MIDI byte (experimental)'),
+        ('midievent', 'MIDI event (experimental)'),
     )
     annotation_rows = (
         ('frames', 'Frames', (A_FRAME,)),
         ('control', 'Sync / User', (A_SYNC, A_USER)),
         ('flags', 'User bits', A_FLAGS),
         ('samples', 'Samples', tuple(range(A_CH0, A_CH0 + CHANNELS))),
+        ('midi_events', 'MIDI events', (A_MIDIEVENT,)),
         ('midi', 'MIDI bytes', (A_MIDIBYTE,)),
         ('bits', 'Bits', (A_BIT, A_MARKER)),
         ('errors', 'Errors', (A_ERROR,)),
@@ -189,10 +217,21 @@ class Decoder(srd.Decoder):
         # high bits in a row means the line is idle and a start bit is safe.
         self.midi_idle_ok = not need_idle
         self.midi_high_since = None
+        self.midi_parser_reset()
         self.midi_frames = []    # (instant, level) of recent frames
         self.midi_start = None   # (last high, first low) frame of a byte in flight
         self.midi_resume = 0     # no new start bit before this sample
         self.midi_last = None
+
+    def midi_parser_reset(self):
+        # A lost byte makes running status unreliable and the message in
+        # progress unfinishable, so both are dropped.
+        self.midi_status = None     # running status
+        self.midi_cur = None        # status of the message in progress
+        self.midi_msg = []          # its data bytes so far
+        self.midi_msg_start = None
+        self.midi_msg_amb = False
+        self.midi_sysex = None      # [start, end, nbytes, amb, first bytes]
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -434,6 +473,138 @@ class Decoder(srd.Decoder):
                 return
             self.midi_finish(lo, hi, bit)
 
+    def midi_event_feed(self, ss, es, byte, amb):
+        """Assemble UART bytes into MIDI messages: running status, realtime
+        bytes between the bytes of another message, SysEx."""
+        if byte >= 0xF8:    # realtime: may sit anywhere, changes no state
+            self.midi_emit(ss, es, [byte], amb)
+            return
+        sx = self.midi_sysex
+        if byte & 0x80:
+            if sx is not None:
+                self.midi_sysex = None
+                if byte == 0xF7:
+                    self.midi_emit_sysex(sx, es, amb, True)
+                    return
+                self.midi_emit_sysex(sx, ss, amb, False)   # cut short
+            self.midi_cur = None
+            self.midi_msg = []
+            if byte == 0xF7:    # end of SysEx with none open
+                self.midi_emit(ss, es, [byte], amb)
+                return
+            if byte == 0xF0:
+                self.midi_status = None
+                self.midi_sysex = [ss, es, 0, amb, []]
+                return
+            # System common cancels running status, channel messages set it.
+            self.midi_status = byte if byte < 0xF0 else None
+            if midi_data_len(byte) == 0:
+                self.midi_emit(ss, es, [byte], amb)
+            else:
+                self.midi_cur = byte
+                self.midi_msg_start = ss
+                self.midi_msg_amb = amb
+            return
+
+        # data byte
+        if sx is not None:
+            sx[1] = es
+            sx[2] += 1
+            sx[3] = sx[3] or amb
+            if len(sx[4]) < 3:
+                sx[4].append(byte)
+            return
+        if self.midi_cur is None:
+            if self.midi_status is None:
+                self.putx(ss, es, [A_MIDIEVENT, [
+                    'Data 0x%02X without status' % byte,
+                    'stray 0x%02X' % byte, '%02X' % byte]])
+                return
+            # Running status: this data byte starts a new message.
+            self.midi_cur = self.midi_status
+            self.midi_msg = []
+            self.midi_msg_start = ss
+            self.midi_msg_amb = False
+        self.midi_msg.append(byte)
+        self.midi_msg_amb = self.midi_msg_amb or amb
+        status = self.midi_cur
+        if len(self.midi_msg) == midi_data_len(status):
+            self.midi_emit(self.midi_msg_start, es, [status] + self.midi_msg,
+                           self.midi_msg_amb)
+            self.midi_cur = None
+            self.midi_msg = []
+
+    def midi_emit_sysex(self, sx, end, amb, complete):
+        start, last, n, sx_amb, head = sx
+        amb = amb or sx_amb
+        who = MIDI_MANUFACTURER.get(head[0]) if head else None
+        label = 'SysEx%s (%d bytes)' % (' ' + who if who else '', n)
+        if not complete:
+            label += ' cut short'
+        self.midi_put_event(start, end, [0xF0] + head, label, label,
+                            'SysEx', amb)
+
+    def midi_put_event(self, ss, es, raw, long_text, short_text, tiny, amb):
+        q = ' ?' if amb else ''
+        self.putx(ss, es, [A_MIDIEVENT, [long_text + q, short_text + q,
+                                         tiny + q]])
+        self.putp(ss, es, ['MIDI_EVENT', {
+            'bytes': raw, 'text': long_text, 'ambiguous': amb}])
+
+    def midi_emit(self, ss, es, raw, amb):
+        st = raw[0]
+        d = raw[1:]
+        ch = (st & 0xF) + 1
+        kind = st & 0xF0
+
+        def note(n):
+            return '%s%d' % (NOTE_NAMES[n % 12], n // 12 - 1)
+
+        if kind == 0x80 or (kind == 0x90 and d[1] == 0):
+            tail = ' (note on, vel 0)' if kind == 0x90 else ''
+            long_t = 'Note Off ch%d %s (%d) vel %d%s' % (ch, note(d[0]), d[0],
+                                                         d[1], tail)
+            short_t, tiny = 'Off ch%d %s' % (ch, note(d[0])), note(d[0])
+        elif kind == 0x90:
+            long_t = 'Note On ch%d %s (%d) vel %d' % (ch, note(d[0]), d[0], d[1])
+            short_t, tiny = 'On ch%d %s v%d' % (ch, note(d[0]), d[1]), note(d[0])
+        elif kind == 0xA0:
+            long_t = 'Poly Pressure ch%d %s (%d) = %d' % (ch, note(d[0]), d[0],
+                                                          d[1])
+            short_t, tiny = 'Poly ch%d %s %d' % (ch, note(d[0]), d[1]), 'AT'
+        elif kind == 0xB0:
+            name = MIDI_CC.get(d[0])
+            cc = 'CC%d %s' % (d[0], name) if name else 'CC%d' % d[0]
+            long_t = '%s ch%d = %d' % (cc, ch, d[1])
+            short_t, tiny = 'CC%d ch%d = %d' % (d[0], ch, d[1]), 'CC%d' % d[0]
+        elif kind == 0xC0:
+            long_t = 'Program Change ch%d -> %d' % (ch, d[0])
+            short_t, tiny = 'PC ch%d %d' % (ch, d[0]), 'PC'
+        elif kind == 0xD0:
+            long_t = 'Channel Pressure ch%d = %d' % (ch, d[0])
+            short_t, tiny = 'Press ch%d %d' % (ch, d[0]), 'AT'
+        elif kind == 0xE0:
+            v = ((d[1] << 7) | d[0]) - 8192
+            long_t = 'Pitch Bend ch%d %+d' % (ch, v)
+            short_t, tiny = 'Bend ch%d %+d' % (ch, v), 'PB'
+        elif st == 0xF1:
+            long_t = 'MTC Quarter Frame type %d value %d' % (d[0] >> 4,
+                                                             d[0] & 0xF)
+            short_t, tiny = 'MTC', 'MTC'
+        elif st == 0xF2:
+            long_t = 'Song Position %d' % ((d[1] << 7) | d[0])
+            short_t, tiny = 'SPP', 'SPP'
+        elif st == 0xF3:
+            long_t = 'Song Select %d' % d[0]
+            short_t, tiny = 'Song %d' % d[0], 'Song'
+        elif st in MIDI_SYSTEM:
+            long_t = MIDI_SYSTEM[st]
+            short_t, tiny = long_t, long_t[:3]
+        else:
+            long_t = 'System 0x%02X' % st
+            short_t, tiny = long_t, '%02X' % st
+        self.midi_put_event(ss, es, raw, long_t, short_t, tiny, amb)
+
     def midi_finish(self, lo, hi, bit):
         # Each UART bit (32 us) spans at least one frame (<= 31 us), so for
         # a candidate edge position every bit holds one or more samples.
@@ -462,6 +633,11 @@ class Decoder(srd.Decoder):
         if not found:
             self.putx(hi, hi + 10 * bit, [A_ERROR, [
                 'MIDI framing error', 'MIDI framing', 'MIDI err']])
+            self.midi_parser_reset()
+            # The low stop bit looks like the start of the next byte, so
+            # wait for the line to go idle again (as after a lost frame).
+            self.midi_idle_ok = False
+            self.midi_high_since = None
             self.midi_resume = hi + 9 * bit
         else:
             decoded = []
@@ -493,6 +669,7 @@ class Decoder(srd.Decoder):
                         'MIDI 0x%02X' % byte, '%02X' % byte]
             self.putx(e, e + 10 * bit, [A_MIDIBYTE, text])
             self.putp(e, e + 10 * bit, ['MIDI', byte, alts])
+            self.midi_event_feed(e, e + 10 * bit, byte, bool(alts))
             self.midi_resume = e + 9 * bit
         self.midi_frames = [f for f in self.midi_frames
                             if f[0] >= self.midi_resume - 1e-9 - bit]

@@ -39,11 +39,12 @@ Restart DSView, add the decoder "ADAT" and assign the receiver output to
 
 Rows: Frames (measured frame rate, bit rate, S/MUX), Sync / User, User bits
 (timecode, MIDI, S/MUX, reserved, one cell each), Samples (one colour per
-channel), MIDI bytes, Bits, Errors.
+channel), MIDI events, MIDI bytes, Bits, Errors.
 
 Python output for stacking: `['SAMPLE', [channel 1..8, signed value]]`,
-`['USER', 0..15]`, `['FLAGS', {'timecode', 'midi', 'smux', 'reserved'}]` and
-`['MIDI', byte, alternatives]`.
+`['USER', 0..15]`, `['FLAGS', {'timecode', 'midi', 'smux', 'reserved'}]`,
+`['MIDI', byte, alternatives]` and `['MIDI_EVENT', {'bytes', 'text',
+'ambiguous'}]`.
 
 ## Frame format implemented
 
@@ -102,9 +103,27 @@ Measured on synthetic streams (random bytes, 20 start phases each, 100 MS/s):
 
 At 32 kHz a frame is almost exactly one UART bit, so nearly every byte is
 ambiguous. Over both 48 and 44.1 kHz the first guess of an ambiguous byte was
-right in 32 of 51 cases. After a damaged frame no byte is output until ten
-high bits have been seen, so back-to-back bytes lose the rest of the burst.
-Whether real hardware uses this encoding is unchecked.
+right in 32 of 51 cases. After a damaged frame or a byte with a bad stop bit no byte is output until
+ten high bits have been seen, so back-to-back bytes lose the rest of the
+burst. Whether real hardware uses this encoding is unchecked.
+
+The **MIDI events** lane assembles the bytes into messages, each spanning
+from its first to its last byte:
+
+- `Note On ch1 C4 (60) vel 100`, `Note Off ...` (a Note On with velocity 0 is
+  shown as Note Off), `Poly Pressure`, `Channel Pressure`
+- `CC7 Volume ch1 = 100` (about 40 controller names, others as `CC3 ch1 = 5`)
+- `Program Change ch6 -> 12`, `Pitch Bend ch1 +1234` (14 bit, centred on 0)
+- `Clock`, `Start`, `Continue`, `Stop`, `Active Sensing`, `System Reset`
+  (realtime bytes may sit inside another message and do not interrupt it)
+- `SysEx Roland (4 bytes)`, with the manufacturer for a few known ids
+- `Song Position`, `Song Select`, `Tune Request`, `MTC Quarter Frame`
+
+Running status is followed; system common messages and any lost byte cancel
+it. A message with an ambiguous byte ends in `?`. A data byte with no status
+(a capture that starts mid-message) shows as `Data 0x40 without status`.
+Note numbering is C4 = 60. The exporter lists the events with their times in
+its report and in the `--json` output.
 
 ## Exporting the audio (WAV, CSV, ...)
 
@@ -167,7 +186,7 @@ rejected with a message.
 `tests/sigrokdecode.py` is a host stand-in for DSView's module and
 `tests/adat_signal.py` generates sampled waveforms and `.dsl` files (with jitter, varispeed,
 corruption, MIDI at all start phases) and `.dsl` files. The suite was
-mutation-checked: 47 deliberate breaks of the decoder and 28 of the exporter
+mutation-checked: 70 deliberate breaks of the decoder and 32 of the exporter
 each turn at least one test red. The exporter's WAV output is read back with
 ffmpeg when it is installed (those tests are skipped otherwise).
 
